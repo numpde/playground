@@ -1,24 +1,45 @@
 #!/usr/bin/env python3
 # /home/ra/repos/playground/20251031-MD-NMR/d_extract_solute.py
-#
-# Extract just the solute (aspirin / strychnine) from solvated MD trajectories,
-# wrap it into the primary periodic box, align all frames to frame 0,
-# and write:
-#   d_extract_solute/<tag>_solute_coords.npy   (n_frames, n_atoms, 3) Å
-#   d_extract_solute/<tag>_solute_ref.pdb      (solute, frame 0 coords)
-#
-# Diagnostics (new):
-#   d_extract_solute/<tag>_rmsd.npy            (n_frames,) heavy-atom RMSD vs frame 0 (Å)
-#   d_extract_solute/<tag>_diag.tsv            summary stats
-#
-# Stdout per system:
-#   frames, atoms, heavy atom count
-#   bounding box span after wrapping/alignment
-#   RMSD mean / max vs frame 0
-#
-# Usage:
-#   python d_extract_solute.py
-#   python d_extract_solute.py <eq_wrapped.pdb> <traj.dcd>
+
+"""
+d_extract_solute.py
+
+Purpose
+-------
+Take each solvated production trajectory from `c_solvated` (solute + solvent,
+periodic box, NPT @ 300 K / 1 bar) and collapse it down to just the solute.
+
+For every system:
+    1. Load <tag>_eq.pdb (topology + box) and <tag>.dcd (production frames).
+    2. Identify the solute heavy atoms (not water / not bulk solvent).
+       - Prefer a distinct non-solvent residue (e.g. the drug/ligand).
+       - Fallback: largest bonded fragment that's < _MAX_SOLUTE_ATOMS.
+    3. For each frame:
+       - wrap that solute as a whole molecule back into the primary unit cell,
+         using its center of geometry (so it's not split across PBC images).
+       - align the wrapped coords to frame 0 using only heavy atoms,
+         then apply that rigid transform to all atoms.
+    4. Record:
+       - aligned coordinates (Å) for all solute atoms
+         → float32 array, shape (F, A, 3)
+       - heavy-atom RMSD to frame 0 (Å) for sanity / clustering later
+       - a "reference" PDB (frame 0 after wrap+align) for QC / QM input
+       - a TSV with summary stats.
+
+Outputs (written under ./d_extract_solute/):
+    <tag>_solute_coords.npy   (F,A,3) float32 Å
+    <tag>_rmsd.npy            (F,) float32 Å, heavy-atom RMSD vs frame0
+    <tag>_solute_ref.pdb      frame-0 solute after wrap+align
+    <tag>_diag.tsv            quick stats
+
+Usage
+-----
+    python d_extract_solute.py
+        auto-discovers c_*/*_eq.pdb (or *_eq_wrapped.pdb) + *.dcd
+
+    python d_extract_solute.py path/to/sys_eq.pdb path/to/sys.dcd
+        process just that pair
+"""
 
 from __future__ import annotations
 
@@ -30,47 +51,53 @@ import numpy as np
 import MDAnalysis as mda
 from bugs import mkdir
 
-# --- constants / heuristics -------------------------------------------------
 
+# Output dir mirrors the other stages (a_init.py, c_solvated.py)
+OUT_DIR = mkdir(Path(__file__).with_suffix(''))  # e.g. ./d_extract_solute/
+
+
+# ---------------------------------------------------------------------
+# constants / heuristics
+# ---------------------------------------------------------------------
+
+# Residue names we consider "bulk solvent", to avoid picking them as the solute.
+# These cover water-like and common NMR solvents.
 _SOLVENT_NAMES = {
     'HOH', 'H2O', 'WAT', 'SOL', 'TIP3', 'TIP3P',
-    'DMS', 'DMSO', 'CL3', 'CDCL3', 'CHCL3'
+    'DMS', 'DMSO', 'CL3', 'CDCL3', 'CHCL3',
 }
 
+# Safety ceiling: if a "candidate solute" has more atoms than this,
+# it's probably the entire box (failed selection).
+_MAX_SOLUTE_ATOMS = 200
 
-# --- helpers ----------------------------------------------------------------
-_MAX_SOLUTE_ATOMS = 200  # sanity ceiling so we don't "select the whole box"
+
+# ---------------------------------------------------------------------
+# PDB writer for the aligned reference frame
+# ---------------------------------------------------------------------
 
 def _write_solute_ref_pdb(out_path: Path, solute_atoms, coords_A0: np.ndarray) -> None:
     """
-    Write a minimal PDB containing ONLY the solute, using the atom
-    metadata from `solute_atoms` and coordinates from coords_A0 (Å).
+    Write a minimal single-residue PDB for the solute using the atom metadata
+    from `solute_atoms` and coordinates coords_A0 (Å) from frame 0.
 
-    We do not try to reconstruct bonds or residues perfectly.
-    We just emit ATOM records with element/type info so you can load
-    the representative conformer into PyMOL / QC software.
-
-    out_path: Path to write
-    solute_atoms: MDAnalysis AtomGroup (the solute we extracted)
-    coords_A0: (A,3) numpy array in Å, frame 0 after wrap+align
+    We intentionally keep it simple:
+    - one residue called "MOL", resid 1
+    - ATOM records, occupancy=1.00, tempFactor=0.00
+    This is good enough to open in PyMOL or feed to QM.
     """
     with out_path.open("w") as fh:
         fh.write("TITLE     solute reference frame 0\n")
 
-        # We'll write a single residue called MOL with resSeq 1
         resname = "MOL"
         resid = 1
 
         for (idx, atom) in enumerate(solute_atoms):
             (x, y, z) = coords_A0[idx]
-            # Atom serials in PDB are 1-based
-            serial = idx + 1
-            # atom.name is usually like "C1", "H12", etc.
+            serial = idx + 1  # PDB is 1-based
             atom_name = (atom.name or f"A{serial}")[:4].rjust(4)
             element = (getattr(atom, "element", None) or atom.name or "X")[0:2].rjust(2)
 
-            # Classic PDB ATOM line, columns aligned.
-            # We're not bothering with occupancy/tempFactor (set to 1.00, 0.00).
             fh.write(
                 f"ATOM  {serial:5d} {atom_name} {resname:>3s} {resid:4d}    "
                 f"{x:8.3f}{y:8.3f}{z:8.3f}"
@@ -80,93 +107,31 @@ def _write_solute_ref_pdb(out_path: Path, solute_atoms, coords_A0: np.ndarray) -
         fh.write("TER\nEND\n")
 
 
+# ---------------------------------------------------------------------
+# solute selection / masks
+# ---------------------------------------------------------------------
 
-def _pick_solute_atoms(u: mda.Universe):
+def _heavy_mask_from_atoms(atomgroup) -> np.ndarray:
     """
-    Return (solute_atoms, heavy_mask) for the solute only, robust to two cases:
-
-    Case 1: normal PDB with many residues (waters are HOH / TIP3, solute is MOL)
-        → pick largest non-solvent residue.
-
-    Case 2: ugly PDB with ONE giant residue containing everything
-        → fall back to bonded fragments: pick the largest fragment
-          that looks like a real molecule (< _MAX_SOLUTE_ATOMS atoms, not just water).
-
-    Raises if we can't find something that looks like a single small molecule.
+    Return a boolean mask [A] where True = heavy atom (not hydrogen).
+    If .element is missing, fall back to first letter of atom.name.
     """
-
-    residues = list(u.residues)
-
-    # --- Case 1: multiple residues → use residue heuristic
-    if len(residues) > 1:
-        solute_res = _largest_nonwater_residue(u)
-        solute_atoms = solute_res.atoms
-        if solute_atoms.n_atoms > _MAX_SOLUTE_ATOMS:
-            raise RuntimeError(
-                f"Candidate solute residue has {solute_atoms.n_atoms} atoms "
-                f"(>{_MAX_SOLUTE_ATOMS}). Looks like whole box, abort."
-            )
-        heavy_mask = _heavy_mask_from_atoms(solute_atoms)
-        return (solute_atoms, heavy_mask)
-
-    # --- Case 2: single giant residue (your current situation)
-    only_res = residues[0]
-    all_atoms = only_res.atoms
-    n_all = all_atoms.n_atoms
-
-    # heuristic sanity: if it's already small, maybe it's actually just the solute PDB
-    if n_all <= _MAX_SOLUTE_ATOMS:
-        heavy_mask = _heavy_mask_from_atoms(all_atoms)
-        return (all_atoms, heavy_mask)
-
-    # otherwise: fragment fallback
-    # MDAnalysis builds connectivity from CONECT records → .fragments splits by bonds.
-    frags = list(all_atoms.fragments)
-    if len(frags) == 1:
-        raise RuntimeError(
-            "Single huge residue and only one bonded fragment. "
-            "Can't isolate solute from solvent. "
-            "You really need the wrapped PDB output."
-        )
-
-    # score fragments:
-    # - must be < _MAX_SOLUTE_ATOMS
-    # - must have at least one carbon (to avoid picking a single water or bare ions)
-    # pick the largest by atom count that passes filters
-    candidates = []
-    for frag in frags:
-        nat = frag.n_atoms
-        if nat > _MAX_SOLUTE_ATOMS:
-            continue
-        elements = [
-            (getattr(a, "element", None) or a.name or "")[0].upper()
-            for a in frag
-        ]
-        has_carbon = ("C" in elements)
-        if not has_carbon and nat <= 4:
-            # 3-atom waters etc → skip
-            continue
-        candidates.append((nat, frag))
-
-    if not candidates:
-        raise RuntimeError(
-            "Could not find a reasonable fragment to treat as solute. "
-            "Need wrapped PDB where the solute is its own residue."
-        )
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    solute_atoms = candidates[0][1]  # biggest plausible organic-ish fragment
-
-    heavy_mask = _heavy_mask_from_atoms(solute_atoms)
-    return (solute_atoms, heavy_mask)
+    mask = []
+    for atom in atomgroup:
+        sym = (getattr(atom, "element", None) or atom.name or "")[0].upper()
+        mask.append(sym != "H")
+    mask = np.array(mask, dtype=bool)
+    if not np.any(mask):
+        raise RuntimeError("Heavy-atom mask is empty (everything is H?)")
+    return mask
 
 
 def _largest_nonwater_residue(universe: mda.Universe):
     """
-    Pick the residue with the most atoms that is not obviously solvent.
-    Works for aspirin in water, strychnine in DMSO, etc.
+    Pick the residue with the most atoms that is not obviously solvent
+    (not in _SOLVENT_NAMES). Works for "aspirin in water", "strychnine in DMSO", etc.
     """
-    candidates = []
+    candidates: list[tuple[int, object]] = []
     for res in universe.residues:
         resname = (res.resname or "").upper()
         if resname not in _SOLVENT_NAMES:
@@ -179,47 +144,125 @@ def _largest_nonwater_residue(universe: mda.Universe):
     return candidates[0][1]  # MDAnalysis.Residue
 
 
+def _pick_solute_atoms(u: mda.Universe):
+    """
+    Return (solute_atoms, heavy_mask) for just the solute.
+
+    Strategy:
+    - If there are multiple residues: pick the largest residue whose
+      name is not in _SOLVENT_NAMES (typical case once the solute is its
+      own residue, and waters/solvent are separate residues).
+    - If there's only one giant residue (bad topology export):
+      fall back to bonded fragments and choose the largest plausible
+      organic fragment (< _MAX_SOLUTE_ATOMS and has carbon).
+    """
+    residues = list(u.residues)
+
+    # Case 1: normal multi-residue topology
+    if len(residues) > 1:
+        solute_res = _largest_nonwater_residue(u)
+        solute_atoms = solute_res.atoms
+        if solute_atoms.n_atoms > _MAX_SOLUTE_ATOMS:
+            raise RuntimeError(
+                f"Candidate solute residue has {solute_atoms.n_atoms} atoms "
+                f"(>{_MAX_SOLUTE_ATOMS}). Looks like the whole box."
+            )
+        heavy_mask = _heavy_mask_from_atoms(solute_atoms)
+        return (solute_atoms, heavy_mask)
+
+    # Case 2: everything got dumped into one residue
+    only_res = residues[0]
+    all_atoms = only_res.atoms
+    n_all = all_atoms.n_atoms
+
+    # If it's already small, just take it directly.
+    if n_all <= _MAX_SOLUTE_ATOMS:
+        heavy_mask = _heavy_mask_from_atoms(all_atoms)
+        return (all_atoms, heavy_mask)
+
+    # Otherwise, try to split into fragments (MDAnalysis uses CONECT/bonds).
+    frags = list(all_atoms.fragments)
+    if len(frags) == 1:
+        raise RuntimeError(
+            "Single huge residue and only one bonded fragment. "
+            "Can't isolate solute from solvent. "
+            "You really need the wrapped per-residue PDB from c_solvated."
+        )
+
+    candidates = []
+    for frag in frags:
+        nat = frag.n_atoms
+        if nat > _MAX_SOLUTE_ATOMS:
+            continue
+        elements = [
+            (getattr(a, "element", None) or a.name or "")[0].upper()
+            for a in frag
+        ]
+        has_carbon = ("C" in elements)
+        # Skip 3-atom waters etc.
+        if not has_carbon and nat <= 4:
+            continue
+        candidates.append((nat, frag))
+
+    if not candidates:
+        raise RuntimeError(
+            "Could not find a reasonable fragment to treat as solute. "
+            "Try exporting eq.pdb with distinct residues."
+        )
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    solute_atoms = candidates[0][1]  # biggest plausible organic-ish fragment
+
+    heavy_mask = _heavy_mask_from_atoms(solute_atoms)
+    return (solute_atoms, heavy_mask)
+
+
+# ---------------------------------------------------------------------
+# geometry ops: PBC wrap, alignment, RMSD
+# ---------------------------------------------------------------------
+
 def _wrap_residue_by_center(coords_A: np.ndarray, box_lengths_A: np.ndarray) -> np.ndarray:
     """
-    Translate a residue's coords (Å) so its center-of-geometry lies in [0,L)
-    along each axis. Assumes orthorhombic box, so box_lengths_A ~ [Lx,Ly,Lz] Å.
+    Translate a residue's coords (Å) so its center-of-geometry lies
+    inside the primary [0, L) unit cell along each axis.
 
-    coords_A:      (A,3) Å
-    box_lengths_A: (3,) Å
-    returns wrapped copy: (A,3) Å
+    Assumes an orthorhombic box (box_lengths_A ~ [Lx, Ly, Lz] in Å).
     """
     center = coords_A.mean(axis=0)  # Å
+    # Compute integer box index of the center, subtract that box to bring COM in [0,L)
     shift = (center - np.floor(center / box_lengths_A) * box_lengths_A) - center
     return coords_A + shift
 
 
 def _kabsch(P: np.ndarray, Q: np.ndarray) -> np.ndarray:
     """
-    Compute optimal rotation R (3x3) that maps P -> Q in least squares sense.
-    P, Q: (N,3) Å, both mean-centered.
+    Compute optimal rotation matrix R (3x3) that best maps P -> Q
+    in a least-squares sense. P, Q are both mean-centered (N,3) in Å.
     """
     C = P.T @ Q
-    (V, S, Wt) = np.linalg.svd(C)
+    (V, _S, Wt) = np.linalg.svd(C)
     R = V @ Wt
+    # Ensure a proper rotation (determinant +1), flip if needed.
     if np.linalg.det(R) < 0.0:
-        # fix improper rotation
         V[:, -1] *= -1.0
         R = V @ Wt
     return R
 
 
 def _align_to_reference(
-        coords_A: np.ndarray,
-        ref_coords_A: np.ndarray,
-        heavy_mask: np.ndarray
+    coords_A: np.ndarray,
+    ref_coords_A: np.ndarray,
+    heavy_mask: np.ndarray,
 ) -> np.ndarray:
     """
-    Rigidly align coords_A (Å) to ref_coords_A (Å) using only heavy atoms
-    to compute the rotation, then apply that rotation to all atoms.
+    Rigidly align coords_A (Å) to ref_coords_A (Å).
 
-    coords_A, ref_coords_A: (A,3) Å
-    heavy_mask:             (A,) bool (True => include in fit)
-    returns aligned copy:   (A,3) Å
+    Fit is computed on heavy atoms only, but the resulting rotation/translation
+    is applied to all atoms.
+
+    coords_A, ref_coords_A : (A,3) Å
+    heavy_mask             : (A,) bool (True => include that atom in fit)
+    returns aligned copy   : (A,3) Å
     """
     P = coords_A[heavy_mask, :]
     Q = ref_coords_A[heavy_mask, :]
@@ -236,48 +279,34 @@ def _align_to_reference(
     return aligned
 
 
-def _heavy_mask_from_atoms(atomgroup) -> np.ndarray:
-    """
-    Boolean mask [A] where True means "not hydrogen".
-    If .element is missing, fall back to first letter of atom.name.
-    """
-    mask = []
-    for atom in atomgroup:
-        sym = (getattr(atom, "element", None) or atom.name or "")[0].upper()
-        mask.append(sym != "H")
-    mask = np.array(mask, dtype=bool)
-    if not np.any(mask):
-        raise RuntimeError("Heavy-atom mask is empty (everything is H?)")
-    return mask
-
-
 def _rmsd_heavy(frame_A: np.ndarray, ref_A: np.ndarray, heavy_mask: np.ndarray) -> float:
     """
-    Heavy-atom RMSD between two aligned frames (Å).
-    frame_A, ref_A: (A,3)
-    heavy_mask:     (A,)
+    Heavy-atom RMSD between two already-aligned frames (Å).
+    frame_A, ref_A : (A,3)
+    heavy_mask     : (A,)
     """
     diff = frame_A[heavy_mask, :] - ref_A[heavy_mask, :]
     return float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
 
 
-def _process_one(tag: str, pdb_path: Path, dcd_path: Path, out_root: Path) -> None:
-    """
-    Extract solute coords over trajectory, align, and emit diagnostics.
+# ---------------------------------------------------------------------
+# core extraction routine
+# ---------------------------------------------------------------------
 
-    Writes:
-      <tag>_solute_coords.npy  (frames x atoms x 3) Å
-      <tag>_solute_ref.pdb
-      <tag>_rmsd.npy           per-frame heavy-atom RMSD vs frame0 (Å)
+def _process_one(tag: str, pdb_path: Path, dcd_path: Path, out_root: Path = OUT_DIR) -> None:
+    """
+    Extract the solute coordinates over a production trajectory and emit:
+      <tag>_solute_coords.npy  (F,A,3) float32 Å
+      <tag>_rmsd.npy           (F,) float32 Å heavy-atom RMSD vs frame0
+      <tag>_solute_ref.pdb     representative conformer (frame0 after wrap+align)
       <tag>_diag.tsv           summary stats
     """
-
     print(f"[extract] {tag}")
 
-    # --- load trajectory
+    # 1) load trajectory (topology from *_eq.pdb, coords/time from *.dcd)
     u = mda.Universe(str(pdb_path), str(dcd_path))
 
-    # --- pick solute residue
+    # 2) isolate solute atoms + heavy-atom mask
     (solute_atoms, heavy_mask) = _pick_solute_atoms(u)
     n_atoms = solute_atoms.n_atoms
     n_heavy = int(np.sum(heavy_mask))
@@ -288,22 +317,23 @@ def _process_one(tag: str, pdb_path: Path, dcd_path: Path, out_root: Path) -> No
     ref_coords_A: np.ndarray | None = None
     last_box_lengths_A: np.ndarray | None = None
 
-    # Track bounding box spans (min/max per frame after wrap+align)
-    spans_tracker = []  # list of (span_x, span_y, span_z) in Å
+    # track bounding-box spans after wrap+align (sanity check for "staying compact")
+    spans_tracker: list[np.ndarray] = []
 
-    for (frame_i, ts) in enumerate(u.trajectory):
-        # assume orthorhombic box
+    # 3) iterate frames
+    for (_frame_i, ts) in enumerate(u.trajectory):
+        # MDAnalysis ts.dimensions ~ [lx, ly, lz, alpha, beta, gamma] in Å / deg
         box_lengths_A = np.array(ts.dimensions[:3], dtype=float)
-        last_box_lengths_A = box_lengths_A  # remember last seen box length
+        last_box_lengths_A = box_lengths_A  # stash most recent box vector lengths
 
         # copy current solute coords (Å)
         coords_A = solute_atoms.positions.copy()
 
-        # wrap COM into primary unit cell so molecule isn't split
+        # wrap COM into primary unit cell so molecule isn't split across the box edge
         coords_wrapped_A = _wrap_residue_by_center(coords_A, box_lengths_A)
 
+        # first frame defines reference
         if ref_coords_A is None:
-            # first frame defines reference geometry
             ref_coords_A = coords_wrapped_A.copy()
             aligned_A = ref_coords_A.copy()
             rmsd_val = 0.0
@@ -318,28 +348,28 @@ def _process_one(tag: str, pdb_path: Path, dcd_path: Path, out_root: Path) -> No
         coords_over_time.append(aligned_A.astype(np.float32))
         rmsd_trace.append(rmsd_val)
 
-        # bounding box of aligned solute (sanity: should be small, e.g. < ~15 Å)
+        # bounding box span of aligned solute
         mins = aligned_A.min(axis=0)
         maxs = aligned_A.max(axis=0)
         spans_tracker.append((maxs - mins))
 
-    coords_arr = np.stack(coords_over_time, axis=0)  # (F,A,3) float32
-    rmsd_arr = np.array(rmsd_trace, dtype=np.float32)  # (F,)
-    spans_arr = np.stack(spans_tracker, axis=0)  # (F,3) Å
-    span_mean = spans_arr.mean(axis=0)  # (3,)
-    span_max = spans_arr.max(axis=0)  # (3,)
+    # stack results
+    coords_arr = np.stack(coords_over_time, axis=0)        # (F,A,3) float32
+    rmsd_arr = np.array(rmsd_trace, dtype=np.float32)      # (F,)
+    spans_arr = np.stack(spans_tracker, axis=0)            # (F,3) Å
+    span_mean = spans_arr.mean(axis=0)                     # (3,)
+    span_max = spans_arr.max(axis=0)                       # (3,)
 
     (F, A, _) = coords_arr.shape
 
-
-    # --- save coords array and RMSD trace
+    # 4) save arrays
     npy_path = out_root / f"{tag}_solute_coords.npy"
     np.save(npy_path, coords_arr)
 
     rmsd_path = out_root / f"{tag}_rmsd.npy"
     np.save(rmsd_path, rmsd_arr)
 
-    # --- save reference solute PDB (frame 0 coords)
+    # 5) save reference solute PDB (frame 0 after wrap+align)
     pdb_out = out_root / f"{tag}_solute_ref.pdb"
     _write_solute_ref_pdb(
         out_path=pdb_out,
@@ -347,8 +377,7 @@ def _process_one(tag: str, pdb_path: Path, dcd_path: Path, out_root: Path) -> No
         coords_A0=coords_arr[0],
     )
 
-
-    # --- write diagnostics TSV
+    # 6) TSV diagnostics
     diag_path = out_root / f"{tag}_diag.tsv"
     with diag_path.open("w") as fh:
         fh.write("# key\tvalue\n")
@@ -379,7 +408,7 @@ def _process_one(tag: str, pdb_path: Path, dcd_path: Path, out_root: Path) -> No
         fh.write(f"rmsd_median_A\t{np.median(rmsd_arr):.4f}\n")
         fh.write(f"rmsd_max_A\t{np.max(rmsd_arr):.4f}\n")
 
-    # --- human-readable summary to stdout
+    # 7) human-readable summary
     print(f"[ok] {tag}")
     print(f"     frames={F}, atoms={A} (heavy {n_heavy})")
     if last_box_lengths_A is not None:
@@ -400,18 +429,26 @@ def _process_one(tag: str, pdb_path: Path, dcd_path: Path, out_root: Path) -> No
         f"{span_max[2]:.2f})"
     )
     print(
-        f"     heavy-atom RMSD vs frame0: "
+        "     heavy-atom RMSD vs frame0: "
         f"mean={np.mean(rmsd_arr):.3f}Å "
         f"max={np.max(rmsd_arr):.3f}Å"
     )
     print(f"     wrote {npy_path.name}, {pdb_out.name}, {rmsd_path.name}, {diag_path.name}")
 
 
-# --- main -------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# job discovery + CLI
+# ---------------------------------------------------------------------
 
 def _find_jobs() -> List[Tuple[str, Path, Path]]:
     """
-    (unchanged)
+    Auto-discover solvated systems produced by c_solvated.py.
+
+    Looks under ./c_*/ for:
+        *_eq.pdb            (or *_eq_wrapped.pdb for backward compat)
+        <tag>.dcd           (production trajectory)
+
+    Returns a list of (tag, pdb_path, dcd_path).
     """
     jobs: list[tuple[str, Path, Path]] = []
 
@@ -422,10 +459,11 @@ def _find_jobs() -> List[Tuple[str, Path, Path]]:
         stem = pdb_path.stem
         tag = (
             stem.removesuffix("_eq_wrapped")
-            .removesuffix("_eq")
-            .removesuffix("_wrapped")
+                .removesuffix("_eq")
+                .removesuffix("_wrapped")
         )
 
+        # Prefer <tag>.dcd, but also allow <tag>*.dcd as a fallback
         dcd_list = list(pdb_path.parent.glob(f"{tag}.dcd"))
         if not dcd_list:
             dcd_list = list(pdb_path.parent.glob(f"{tag}*.dcd"))
@@ -434,6 +472,7 @@ def _find_jobs() -> List[Tuple[str, Path, Path]]:
             print(f"[skip] no DCD for {pdb_path}")
             continue
 
+        # shortest filename wins (deterministic if multiple chunks exist)
         dcd_path = sorted(dcd_list, key=lambda p: len(p.name))[0]
         jobs.append((tag, pdb_path, dcd_path))
 
@@ -441,9 +480,7 @@ def _find_jobs() -> List[Tuple[str, Path, Path]]:
 
 
 def main():
-    out_root = mkdir(Path(__file__).with_suffix(''))  # e.g. d_extract_solute/
-
-    # Explicit mode
+    # Explicit file pair mode
     if len(sys.argv) == 3:
         pdb_path = Path(sys.argv[1]).resolve()
         dcd_path = Path(sys.argv[2]).resolve()
@@ -453,24 +490,24 @@ def main():
             .removesuffix("_eq")
             .removesuffix("_wrapped")
         )
-        _process_one(tag, pdb_path, dcd_path, out_root)
+        _process_one(tag, pdb_path, dcd_path, OUT_DIR)
         return
 
-    # Auto mode
+    # Auto-discovery mode
     if len(sys.argv) == 1:
         jobs = _find_jobs()
         if not jobs:
             print("[error] no systems found under c_*/")
             return
         for (tag, pdb_path, dcd_path) in jobs:
-            _process_one(tag, pdb_path, dcd_path, out_root)
+            _process_one(tag, pdb_path, dcd_path, OUT_DIR)
         print("[done]")
         return
 
     # bad usage
     print("Usage:")
-    print("  python d_extract_solute.py <eq_wrapped.pdb> <traj.dcd>")
-    print("  python d_extract_solute.py   # auto-discover in c_*/")
+    print("  python d_extract_solute.py <eq.pdb> <traj.dcd>")
+    print("  python d_extract_solute.py          # auto-discover in c_*/")
     sys.exit(1)
 
 
