@@ -3,26 +3,83 @@
 """
 c_solvated.py
 
-Goal:
-- Build aspirin / strychnine in explicit solvent (water / DMSO / CDCl3)
-- Pack solvent at ~liquid density
-- Run NPT (300 K, 1 bar) using OpenMM on multithreaded CPU
-- Dump:
-    *_minimized.pdb   (after energy minimization)
-    *_eq.pdb          (after equilibration, use this as PyMOL reference)
-    *.dcd / *.log     (production trajectory + thermodynamics)
+Build and simulate an explicit-solvent box for each
+protonation/tautomer state defined in a_init.TARGETS.
 
-Stability changes vs last version:
-- pack solvent on a grid at ~correct density (no huge vacuum / no barostat collapse)
-- 1 fs timestep (safer; 4 fs was too aggressive for generic organics)
-- two-phase equilibration (short settle + longer NPT)
-- explicit CPU platform with all cores
+Pipeline context:
+- a_init.py writes per-state starting structures
+  (e.g. aspirin_neutral_init.pdb) with the correct
+  protonation for a given solvent / pH scenario.
+- b_openmm.py sanity-checks each state in vacuum.
+- c_solvated.py (this file) puts that state into
+  bulk solvent, equilibrates it, and runs short
+  production MD so later steps can cluster
+  conformers and feed them to NMR prediction.
+
+What this script actually does:
+1. Load the *_init.pdb for each TARGETS entry and
+   rebuild the OpenFF Molecule with that geometry.
+   The solute is treated as a single residue "LIG".
+2. Pack a periodic cubic box (BOX_EDGE_NM) with
+   explicit solvent molecules ("SOL") at roughly
+   experimental molar density. Solvent choices:
+   water, DMSO, CDCl3. Each solvent copy is given
+   a random rotation/orientation before placement,
+   not just tiled.
+3. Build an OpenMM System using OpenFF 2.x (and
+   TIP3P for water), add a MonteCarloBarostat
+   (1 bar, 300 K), and a LangevinMiddleIntegrator
+   (300 K, 1 fs timestep).
+4. Add a CustomExternalForce that applies a
+   harmonic positional restraint (k_restraint) to
+   heavy atoms of the solute only. These restraints
+   are active during PRE_EQ to let solvent resolve
+   clashes and form a first solvation shell without
+   letting the solute deform.
+5. PRE_EQ:
+   - minimize
+   - short restrained NPT run (PRE_EQ_PS)
+   - checkpoint
+6. After PRE_EQ, set k_restraint → 0. Then run a
+   longer unrestrained NPT equilibration (EQ_PS),
+   checkpoint again, and dump a wrapped PDB
+   snapshot with residues imaged back into the
+   primary unit cell.
+7. Production:
+   - continue the same Simulation
+   - run geometrically increasing chunks
+     (1 ps, 10 ps, 100 ps, 1000 ps)
+   - stream thermodynamics
+   - append all coordinates to a single DCD
+   - write checkpoint PDBs after each chunk
+
+Outputs (per target, per solvent):
+- <name>_<solvent>_minimized.pdb
+- <name>_<solvent>_eq.pdb
+- <name>_<solvent>.dcd
+- <name>_<solvent>.log
+- periodic checkpoints like
+  <name>_<solvent>_chk_100ps.pdb
+plus PRE_EQ/EQ checkpoint blobs (.chk).
+
+Downstream expectations:
+- d_extract_solute.py can now trivially isolate
+  the solute as residue "LIG" and ignore solvent
+  "SOL".
+- e_cluster.py can cluster heavy-atom RMSD across
+  production frames, estimate conformer basins,
+  and give representative structures for QM/NMR.
+
+This script assumes CPU platform by default and
+uses all local threads. GPU migration later is
+mechanical: same topology, same forces, just a
+different Platform().
 """
 
 import math
 import os
-import sys
 from pathlib import Path
+from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import openmm
@@ -39,53 +96,71 @@ from openmm.app import (
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from a_init import TARGETS  # [{'name','smiles','pdb'}, ...]
+import a_init
+from a_init import TARGETS  # [{'name','smiles','pdb','charge',...}, ...]
 
-# output dir: ./c_solvated  (basename of this file)
-OUT_DIR = mkdir(Path(__file__).with_suffix(''))
+# ---------------------------------------------------------------------
+# output locations
+# ---------------------------------------------------------------------
+
+A_INIT_DIR = Path(a_init.__file__).with_suffix('')  # where a_init wrote *_init.pdb
+OUT_DIR = mkdir(Path(__file__).with_suffix(''))  # ./c_solvated/
+
+# ---------------------------------------------------------------------
+# MD / thermodynamic settings
+# ---------------------------------------------------------------------
+
+SOLVENT_CHOICE = "dmso"  # "dmso", "water", "cdcl3"
+BOX_EDGE_NM = 3.0  # cubic periodic box edge length (nm)
+
+TARGET_TEMP = 300 * unit.kelvin
+TARGET_PRESSURE = 1 * unit.bar
+
+TIMESTEP_PS = 0.001  # 1 fs = 0.001 ps
+FRICTION = 1.0 / unit.picosecond
+
+PRE_EQ_PS = 50.0  # short restrained pre-equilibration
+EQ_PS = 950.0  # long NPT settle
+REPORT_INT_STEPS = 1000  # report every 1000 steps (~1 ps at 1 fs)
+
+PRE_EQ_STEPS = int(PRE_EQ_PS / TIMESTEP_PS)  # 50,000 steps
+EQ_STEPS = int(EQ_PS / TIMESTEP_PS)  # 950,000 steps
+
+# Harmonic positional restraint strength for solute heavy atoms during PRE_EQ.
+# Units: kJ/mol/nm^2. Will be turned off (set to 0) after PRE_EQ.
+PRE_EQ_RESTRAINT_K = 1000.0 * unit.kilojoule_per_mole / (unit.nanometer ** 2)
 
 
-# ---------- geometry / conversion helpers ----------
-
-def _rdkit_embed_minimize(smiles: str, label: str):
+def _load_coords_from_init_pdb(pdb_path: Path) -> Tuple[np.ndarray, PDBFile]:
     """
-    RDKit:
-    - SMILES -> mol with explicit H
-    - embed 3D (ETKDGv3)
-    - MMFF94s geometry refine
-    returns (rdmol, coords_A) with coords in Å
+    Read the *_init.pdb from a_init for this protomer.
+    Returns:
+      coords_A  : (N,3) float64 in Å
+      pdb_obj   : OpenMM PDBFile (has topology)
+    Note: PDBFile gives positions in nm; convert to Å.
+    """
+    pdb_obj = PDBFile(str(pdb_path))
+    pos_nm = pdb_obj.getPositions(asNumpy=True).value_in_unit(unit.nanometer)  # (N,3)
+    coords_A = pos_nm * 10.0  # 1 nm = 10 Å
+    return (coords_A, pdb_obj)
+
+
+def _rdkit_from_smiles_with_H(smiles: str) -> Chem.Mol:
+    """
+    Rebuild RDKit mol from SMILES with explicit H, preserving atom order.
+    The SMILES here is the same one used in a_init, so ordering should match
+    the *_init.pdb atoms.
     """
     rdmol = Chem.MolFromSmiles(smiles)
     if rdmol is None:
-        raise ValueError(f"Bad SMILES for {label}")
+        raise ValueError(f"Bad SMILES: {smiles}")
     rdmol = Chem.AddHs(rdmol)
-
-    params = AllChem.ETKDGv3()
-    params.randomSeed = 12345
-    cid = AllChem.EmbedMolecule(rdmol, params)
-    if cid < 0:
-        raise RuntimeError(f"Conformer gen failed for {label}")
-
-    AllChem.MMFFOptimizeMolecule(
-        rdmol,
-        mmffVariant="MMFF94s",
-        maxIters=500,
-        confId=cid,
-    )
-
-    conf = rdmol.GetConformer(cid)
-    n_atoms = rdmol.GetNumAtoms()
-    coords_A = np.zeros((n_atoms, 3), dtype=float)
-    for i in range(n_atoms):
-        p = conf.GetAtomPosition(i)  # Å
-        coords_A[i] = (p.x, p.y, p.z)
-
-    return (rdmol, coords_A)
+    return rdmol
 
 
-def _off_mol_from_rdkit_with_coords(rdmol, coords_A):
+def _off_mol_with_conformer(rdmol: Chem.Mol, coords_A: np.ndarray) -> Molecule:
     """
-    RDKit mol -> OpenFF Molecule with same atom ordering + conformer.
+    RDKit mol -> OpenFF Molecule with same atom ordering and an attached conformer.
     coords_A: (N,3) Å
     """
     off_mol = Molecule.from_rdkit(rdmol, hydrogens_are_explicit=True)
@@ -93,19 +168,18 @@ def _off_mol_from_rdkit_with_coords(rdmol, coords_A):
     return off_mol
 
 
-def _center_coords(coords_nm: np.ndarray) -> np.ndarray:
+def _center_coords_nm(coords_nm: np.ndarray) -> np.ndarray:
     """
-    Translate coords so centroid ~0.
-    coords_nm: (N,3) in nm
+    Translate coords so centroid is ~0.
+    coords_nm: (N,3) nm
     """
     ctr = coords_nm.mean(axis=0, keepdims=True)
     return coords_nm - ctr
 
 
-def _make_box_vectors(box_nm: float):
+def _make_box_vectors(box_nm: float) -> np.ndarray:
     """
-    Build a cubic periodic box of edge length box_nm [nm].
-    Returns (3,3) np.array.
+    Create 3x3 box matrix for an orthorhombic cube of edge box_nm [nm].
     """
     a = box_nm
     return np.array(
@@ -118,15 +192,13 @@ def _make_box_vectors(box_nm: float):
     )
 
 
-# ---------- solvent packing helpers ----------
-
 def _estimate_n_solvent(solvent_kind: str, box_nm: float) -> int:
     """
-    Approximate liquid-like number of solvent molecules in a cubic box_nm^3 nm^3.
+    Estimate how many solvent molecules fit in a box_nm^3 nm^3 at ~bulk density.
 
     Bulk molar densities (mol/L):
       water:   ~55.5
-      dmso:    ~14.0   (ρ≈1.10 g/mL, M≈78)
+      dmso:    ~14.0   (ρ≈1.1 g/mL, M≈78)
       cdcl3:   ~12.4   (ρ≈1.48 g/mL, M≈119)
 
     molecules_per_nm3 = mol/L * 0.602214
@@ -146,67 +218,91 @@ def _estimate_n_solvent(solvent_kind: str, box_nm: float) -> int:
     return max(n, 1)
 
 
-def _prepare_solute(solute_smiles: str, solute_name: str):
+def _embed_minimize_solvent_template(smiles: str, label: str) -> Tuple[np.ndarray, Molecule]:
     """
-    Build OpenFF Molecule for solute + centered coords in nm.
+    Make a single solvent molecule template:
+    - RDKit embed (ETKDGv3) + MMFF94s optimize
+    - convert to OpenFF Molecule
+    - return centered coords (nm) + off_mol
     """
-    (solute_rdmol, solute_coords_A) = _rdkit_embed_minimize(solute_smiles, solute_name)
-    off_solute = _off_mol_from_rdkit_with_coords(solute_rdmol, solute_coords_A)
+    rdmol = Chem.MolFromSmiles(smiles)
+    if rdmol is None:
+        raise ValueError(f"Bad solvent SMILES for {label}")
+    rdmol = Chem.AddHs(rdmol)
 
-    solute_coords_nm = solute_coords_A * 0.1  # Å -> nm
-    solute_coords_nm = _center_coords(solute_coords_nm)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = 12345
+    cid = AllChem.EmbedMolecule(rdmol, params)
+    if cid < 0:
+        raise RuntimeError(f"Conformer gen failed for solvent {label}")
 
-    return (off_solute, solute_coords_nm)
+    AllChem.MMFFOptimizeMolecule(
+        rdmol,
+        mmffVariant="MMFF94s",
+        maxIters=200,
+        confId=cid,
+    )
+
+    # pull coords in Å
+    conf = rdmol.GetConformer(cid)
+    Ns = rdmol.GetNumAtoms()
+    coords_A = np.zeros((Ns, 3), dtype=float)
+    for i in range(Ns):
+        p = conf.GetAtomPosition(i)
+        coords_A[i] = (p.x, p.y, p.z)
+
+    # to nm and center
+    coords_nm = coords_A * 0.1
+    coords_nm = _center_coords_nm(coords_nm)
+
+    off_solv = Molecule.from_rdkit(rdmol, hydrogens_are_explicit=True)
+    off_solv.add_conformer(coords_A * offunit.angstrom)
+
+    return (coords_nm, off_solv)
 
 
-def _prepare_solvent_template(solvent_kind: str):
+def _random_rotation_matrix(rng: np.random.Generator) -> np.ndarray:
     """
-    Return (off_solvent, template_coords_nm_centered)
+    Generate a random 3x3 rotation matrix (uniform over SO(3)).
     """
-    if solvent_kind == "water":
-        solvent_smiles = "O"  # H2O
-    elif solvent_kind == "dmso":
-        solvent_smiles = "CS(=O)C"  # DMSO
-    elif solvent_kind == "cdcl3":
-        solvent_smiles = "ClC(Cl)Cl"  # CHCl3 ~= CDCl3 (ignore isotope)
-    else:
-        raise ValueError(f"Unknown solvent_kind {solvent_kind}")
-
-    (solv_rdmol, solv_coords_A) = _rdkit_embed_minimize(solvent_smiles, solvent_kind)
-    off_solvent = _off_mol_from_rdkit_with_coords(solv_rdmol, solv_coords_A)
-
-    solv_coords_nm = solv_coords_A * 0.1  # Å -> nm
-    solv_coords_nm = _center_coords(solv_coords_nm)
-
-    return (off_solvent, solv_coords_nm)
+    # method: random unit quaternion
+    u1, u2, u3 = rng.random(3)
+    q1 = math.sqrt(1 - u1) * math.sin(2 * math.pi * u2)
+    q2 = math.sqrt(1 - u1) * math.cos(2 * math.pi * u2)
+    q3 = math.sqrt(u1) * math.sin(2 * math.pi * u3)
+    q4 = math.sqrt(u1) * math.cos(2 * math.pi * u3)
+    # quaternion -> rotation matrix
+    R = np.array([
+        [1 - 2 * (q3 * q3 + q4 * q4), 2 * (q2 * q3 - q4 * q1), 2 * (q2 * q4 + q3 * q1)],
+        [2 * (q2 * q3 + q4 * q1), 1 - 2 * (q2 * q2 + q4 * q4), 2 * (q3 * q4 - q2 * q1)],
+        [2 * (q2 * q4 - q3 * q1), 2 * (q3 * q4 + q2 * q1), 1 - 2 * (q2 * q2 + q3 * q3)],
+    ], dtype=float)
+    return R
 
 
-def _place_solvent_grid(
+def _place_solvent_grid_random_orient(
         template_coords_nm: np.ndarray,
         n_copies: int,
         box_nm: float,
         min_dist_from_origin_nm: float = 0.4,
-):
+        seed: int = 12345,
+) -> List[np.ndarray]:
     """
-    Place n_copies solvent molecules in a simple 3D lattice.
-
-    - tile box into n_per_dim^3 cells
-    - place the solvent COM at each cell center
-    - skip cells too close to solute center (< min_dist_from_origin_nm)
-    - if we still need more, fill remaining cells (fallback)
+    Place n_copies solvent molecules in a simple 3D lattice, each with a random
+    rotation and translation. Skip cells too close to the solute center, then
+    fill remaining if needed.
 
     Returns:
       coords_list_nm: list of (Ns,3) arrays for each solvent copy in nm
     """
     Ns = template_coords_nm.shape[0]
 
+    # lattice centers
     n_per_dim = math.ceil(n_copies ** (1.0 / 3.0))
     capacity = n_per_dim ** 3
     if capacity < n_copies:
         n_per_dim += 1
         capacity = n_per_dim ** 3
-
-    cell = box_nm / n_per_dim  # nm per grid cell
 
     centers = []
     for ix in range(n_per_dim):
@@ -217,89 +313,121 @@ def _place_solvent_grid(
                 cz = (iz + 0.5) / n_per_dim - 0.5
                 centers.append((cx * box_nm, cy * box_nm, cz * box_nm))
 
-    rng = np.random.default_rng(12345)
+    rng = np.random.default_rng(seed)
     rng.shuffle(centers)
 
-    coords_list_nm = []
+    coords_list_nm: List[np.ndarray] = []
     used = 0
+
+    def _rot_then_shift(R: np.ndarray, shift_nm: np.ndarray) -> np.ndarray:
+        # template_coords_nm is (Ns,3)
+        rotated = template_coords_nm @ R.T  # (Ns,3)
+        return rotated + shift_nm[None, :]  # broadcast add
+
+    # first pass: avoid solute core
     for (cx, cy, cz) in centers:
         if used >= n_copies:
             break
         dist0 = math.sqrt(cx * cx + cy * cy + cz * cz)
         if dist0 < min_dist_from_origin_nm:
             continue
-        shift = np.array([[cx, cy, cz]], dtype=float)  # (1,3)
-        this_coords = template_coords_nm + shift  # (Ns,3)
-        coords_list_nm.append(this_coords)
+        R = _random_rotation_matrix(rng)
+        shift = np.array([cx, cy, cz], dtype=float)
+        coords_list_nm.append(_rot_then_shift(R, shift))
         used += 1
 
+    # fallback fill
     if used < n_copies:
-        # fallback: fill remaining cells even if close to origin
         for (cx, cy, cz) in centers:
             if used >= n_copies:
                 break
-            shift = np.array([[cx, cy, cz]], dtype=float)
-            this_coords = template_coords_nm + shift
-            coords_list_nm.append(this_coords)
+            R = _random_rotation_matrix(rng)
+            shift = np.array([cx, cy, cz], dtype=float)
+            coords_list_nm.append(_rot_then_shift(R, shift))
             used += 1
 
     return coords_list_nm
 
 
-# ---------- OpenMM system builder ----------
-
 def _build_solvated_sim(
-        solute_smiles: str,
-        solute_name: str,
-        solvent_kind: str = "water",  # "water", "dmso", "cdcl3"
-        box_nm: float = 3.0,
-):
+        job: Dict,
+        solvent_kind: str,
+        box_nm: float,
+) -> Simulation:
     """
-    Create an OpenMM Simulation (CPU platform, multithreaded) of `solute_name`
-    solvated in `solvent_kind` at 300 K / 1 bar.
+    Build an OpenMM Simulation with:
+    - solute from a_init (correct protonation/tautomer)
+    - explicit solvent box at approx bulk density
+    - periodic boundary conditions
+    - barostat at 1 bar / 300 K
+    - Langevin thermostat at 300 K
+    - harmonic restraints on solute heavy atoms via a CustomExternalForce
+      (restraints active initially, will be turned off after PRE_EQ)
 
-    Steps:
-    - build solute coords (centered)
-    - build solvent template coords (centered)
-    - estimate number of solvent molecules for ~liquid density
-    - pack solvent on a lattice
-    - create OpenFF Topology w/ periodic box
-    - create OpenMM System via OpenFF ForceField
-    - add barostat (1 bar / 300 K)
-    - LangevinMiddleIntegrator @ 300 K
-    - CPU platform with all cores
-    - set initial coords and periodic box vectors
+    Returns:
+      Simulation (CPU platform, multithreaded)
     """
 
-    # 1) solute
-    (off_solute, solute_coords_nm) = _prepare_solute(solute_smiles, solute_name)
+    name = job["name"]
+    smiles = job["smiles"]
+    pdb_rel = job["pdb"]
+    pdb_path = A_INIT_DIR / pdb_rel
 
-    # 2) solvent template + count
-    (off_solvent, solvent_template_nm) = _prepare_solvent_template(solvent_kind)
-    n_solvent = _estimate_n_solvent(solvent_kind, box_nm)
+    # --- solute coords from a_init pdb
+    (solute_coords_A, _pdb_obj) = _load_coords_from_init_pdb(pdb_path)
+    rdmol_solute = _rdkit_from_smiles_with_H(smiles)
+    off_solute = _off_mol_with_conformer(rdmol_solute, solute_coords_A)
 
-    # 3) place solvent
-    solvent_coords_list_nm = _place_solvent_grid(
-        solvent_template_nm,
-        n_copies=n_solvent,
-        box_nm=box_nm,
+    # center solute in nm at origin
+    solute_coords_nm = (solute_coords_A * 0.1)  # Å -> nm
+    solute_coords_nm = _center_coords_nm(solute_coords_nm)
+
+    n_solute_atoms = off_solute.n_atoms
+    heavy_idx_solute: List[int] = [
+        i for (i, atom) in enumerate(off_solute.atoms)
+        if atom.atomic_number != 1
+    ]
+
+    # --- solvent template
+    if solvent_kind == "water":
+        solv_smiles = "O"  # H2O
+    elif solvent_kind == "dmso":
+        solv_smiles = "CS(=O)C"  # DMSO
+    elif solvent_kind == "cdcl3":
+        solv_smiles = "ClC(Cl)Cl"  # CHCl3 ~ CDCl3 (ignore isotope)
+    else:
+        raise ValueError(f"Unknown solvent {solvent_kind}")
+
+    (solvent_template_nm, off_solvent) = _embed_minimize_solvent_template(
+        solv_smiles,
+        solvent_kind,
     )
 
-    # 4) stitch coords: [solute] + [solvent_i ...]
-    molecules_for_top = [off_solute] + [off_solvent] * len(solvent_coords_list_nm)
+    n_solvent = _estimate_n_solvent(solvent_kind, box_nm)
 
+    solvent_coords_list_nm = _place_solvent_grid_random_orient(
+        template_coords_nm=solvent_template_nm,
+        n_copies=n_solvent,
+        box_nm=box_nm,
+        min_dist_from_origin_nm=0.4,
+        seed=12345,
+    )
+
+    # --- stitch coordinates [solute first, then all solvent copies]
     coords_all_nm = np.concatenate(
         [solute_coords_nm] + solvent_coords_list_nm,
         axis=0,
-    )  # shape (Ntotal,3) in nm
+    )  # (N_total,3) nm
 
-    # 5) topology w/ PBC
-    box_vectors = _make_box_vectors(box_nm)  # (3,3)
+    # --- build OpenFF Topology for solute + many solvent molecules
+    molecules_for_top = [off_solute] + [off_solvent] * len(solvent_coords_list_nm)
+
+    box_vectors = _make_box_vectors(box_nm)  # (3,3), nm
     top_off = Topology.from_molecules(molecules_for_top)
     top_off.box_vectors = box_vectors * offunit.nanometer
 
-    # 6) force field
-    # TIP3P is needed for water; other solvents come from general FF
+    # --- parameterize
+    # water needs tip3p; other solvents use general OpenFF
     if solvent_kind == "water":
         ff = ForceField("openff-2.0.0.offxml", "tip3p.offxml")
     else:
@@ -307,115 +435,126 @@ def _build_solvated_sim(
 
     system = ff.create_openmm_system(top_off)
 
-    # barostat for NPT (1 bar / 300 K)
-    system.addForce(openmm.MonteCarloBarostat(1 * unit.bar, 300 * unit.kelvin))
+    # add NPT barostat
+    system.addForce(openmm.MonteCarloBarostat(TARGET_PRESSURE, TARGET_TEMP))
 
-    # 7) integrator
-    # Stable timestep: 1 fs (0.001 ps)
-    # friction 1/ps is fine for Langevin thermostat
+    # add harmonic positional restraints on heavy solute atoms
+    # We'll control strength via global parameter k_restraint
+    restraint = openmm.CustomExternalForce(
+        "0.5*k_restraint*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)"
+    )
+    restraint.addGlobalParameter(
+        "k_restraint",
+        PRE_EQ_RESTRAINT_K,
+    )
+    restraint.addPerParticleParameter("x0")
+    restraint.addPerParticleParameter("y0")
+    restraint.addPerParticleParameter("z0")
+
+    for idx in heavy_idx_solute:
+        ref_pos = coords_all_nm[idx]  # nm
+        restraint.addParticle(
+            idx,
+            [ref_pos[0], ref_pos[1], ref_pos[2]],
+        )
+
+    system.addForce(restraint)
+
+    # integrator
     integrator = openmm.LangevinMiddleIntegrator(
-        300 * unit.kelvin,
-        1.0 / unit.picosecond,
-        0.001 * unit.picoseconds,  # 1 fs
+        TARGET_TEMP,
+        FRICTION,
+        TIMESTEP_PS * unit.picoseconds,
     )
 
-    # 8) multithreaded CPU platform
+    # multithreaded CPU platform
     platform = openmm.Platform.getPlatformByName("CPU")
     n_threads = os.cpu_count() or 1
     platform_props = {"Threads": str(n_threads)}
 
-    # 9) Simulation
+    # Simulation
     top_omm = top_off.to_openmm()
+
+    # rename residues for downstream extraction:
+    # first residue = solute
+    residues = list(top_omm.residues())
+    if residues:
+        residues[0].name = "LIG"
+        for res in residues[1:]:
+            res.name = "SOL"
+
     sim = Simulation(top_omm, system, integrator, platform, platform_props)
 
-    # 10) initial coordinates + periodic box
+    # set positions and periodic box
     sim.context.setPositions(coords_all_nm * unit.nanometer)
     a_vec = box_vectors[0] * unit.nanometer
     b_vec = box_vectors[1] * unit.nanometer
     c_vec = box_vectors[2] * unit.nanometer
     sim.context.setPeriodicBoxVectors(a_vec, b_vec, c_vec)
 
+    # By default PRE_EQ_RESTRAINT_K is active.
+    # We'll later set it to 0 after PRE_EQ via sim.context.setParameter("k_restraint", 0*...)
     return sim
 
 
-def _write_snapshot_pdb_wrapped(sim, out_path):
+def _write_snapshot_pdb_wrapped(sim: Simulation, out_path: Path) -> None:
     """
-    Periodic imaging for nice visualization:
-    - keep every residue (water, solute) whole
-    - place each residue's center into the primary unit cell [0,L)
-    Assumes an orthorhombic box (diagonal box vectors).
+    Wrap each residue into the primary unit cell for visualization:
+    keep residue intact, shift COM into [0,L) in each dimension,
+    then write a PDB with those wrapped coords.
+    Assumes orthorhombic box.
     """
-    # grab positions and box
     state = sim.context.getState(getPositions=True)
     pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)  # (N,3)
+
     (avec, bvec, cvec) = sim.context.getState().getPeriodicBoxVectors(asNumpy=True)
 
     box_lengths = np.array([
         avec[0].value_in_unit(unit.nanometer),
         bvec[1].value_in_unit(unit.nanometer),
         cvec[2].value_in_unit(unit.nanometer),
-    ])  # [Lx, Ly, Lz] nm
+    ], dtype=float)  # (3,)
 
-    # we'll build a new coord array we can edit
     wrapped_nm = np.zeros_like(pos_nm)
-
-    # iterate residues (each water is its own residue; solute should be one residue)
     top = sim.topology
+
     for res in top.residues():
-        # collect atom indices for this residue
         idxs = [atom.index for atom in res.atoms()]
-        coords = pos_nm[idxs, :]  # (n_res_atoms,3)
+        coords = pos_nm[idxs, :]
+        center = coords.mean(axis=0)
 
-        # compute residue "center"
-        center = coords.mean(axis=0)  # nm
-
-        # wrap center into primary cell
         center_wrapped = center - np.floor(center / box_lengths) * box_lengths
-
-        # shift all atoms by the same delta
         shift = center_wrapped - center
         wrapped_nm[idxs, :] = coords + shift
 
-    # convert back to OpenMM Quantity and write PDB
     wrapped_q = wrapped_nm * unit.nanometer
     with open(out_path, "w") as fh:
         PDBFile.writeFile(top, wrapped_q, fh, keepIds=True)
 
 
 def run_production_in_chunks(
-        sim,
+        sim: Simulation,
         name: str,
         solvent_choice: str,
         base_ps: float = 1.0,
-        multipliers: list[float] = [1.0, 10.0, 100.0, 1000.0],
-        timestep_ps: float = 0.001,
-        report_interval_steps: int = 1000,
-        dcd_path: Path | None = None,
-        log_path: Path | None = None,
+        multipliers: List[float] = [1.0, 10.0, 100.0, 1000.0],
+        timestep_ps: float = TIMESTEP_PS,
+        report_interval_steps: int = REPORT_INT_STEPS,
+        dcd_path: Optional[Path] = None,
+        log_path: Optional[Path] = None,
 ):
     """
-    Run production MD in geometric time chunks.
-    After each chunk, write a snapshot PDB so we can inspect convergence.
-
-    sim                : OpenMM Simulation (already equilibrated, barostat/thermostat on)
-    name, solvent_choice : tags for filenames
-    base_ps            : smallest chunk length in picoseconds
-    multipliers        : geometric schedule in units of base_ps
-    timestep_ps        : integration step in ps (1 fs = 0.001 ps)
-    report_interval_steps : how often to write to reporters
-    dcd_path / log_path   : files for continuous trajectory + thermodynamics
+    After equilibration, run production in geometrically increasing chunks
+    (1 ps, 10 ps, 100 ps, 1000 ps, ...) and:
+    - append to a single DCD
+    - log thermodynamics
+    - write a checkpoint PDB after each chunk
     """
-
     import sys
 
-    # attach reporters ONCE so DCD/log is continuous across chunks
     sim.reporters = [
-        # live progress to stdout for current chunk (we'll replace this per chunk)
-        # placeholder; we'll overwrite this element in the loop
-        None,
-        # trajectory
+        None,  # chunk-scoped live reporter (we'll overwrite this per chunk)
         DCDReporter(str(dcd_path), report_interval_steps),
-        # logfile
         StateDataReporter(
             str(log_path),
             report_interval_steps,
@@ -427,13 +566,11 @@ def run_production_in_chunks(
         ),
     ]
 
-    # index 0 in sim.reporters will be swapped each chunk with a chunk-scoped progress reporter
-
     for mult in multipliers:
         chunk_ps = base_ps * mult
         chunk_steps = int(chunk_ps / timestep_ps)
 
-        # replace sim.reporters[0] with a fresh StateDataReporter
+        # live progress for this chunk
         sim.reporters[0] = StateDataReporter(
             sys.stdout,
             report_interval_steps,
@@ -441,79 +578,58 @@ def run_production_in_chunks(
             progress=True,
             remainingTime=True,
             speed=True,
-            totalSteps=chunk_steps,  # so this chunk prints 0→100%
+            totalSteps=chunk_steps,
             temperature=True,
             potentialEnergy=True,
             volume=True,
             separator="\t",
         )
 
-        # integrate this chunk
         sim.step(chunk_steps)
 
-        # checkpoint snapshot after this chunk
         chk_path = OUT_DIR / f"{name}_{solvent_choice}_chk_{int(chunk_ps)}ps.pdb"
         _write_snapshot_pdb_wrapped(sim, chk_path)
-        print(f"[checkpoint] {name} {solvent_choice} @ +{chunk_ps} ps -> {chk_path.name}")
+        print(f"[checkpoint] {name} {solvent_choice} +{chunk_ps} ps -> {chk_path.name}")
 
-
-# ---------- main ----------
 
 def main():
-    solvent_choice = "water"  # "water", "dmso", "cdcl3"
-    box_nm = 3.0  # nm cube edge
-
-    # timestep = 1 fs = 0.001 ps
-    TIMESTEP_PS = 0.001
-
-    PRE_EQ_PS = 50.0  # short pre-equilibration
-    EQ_PS = 950.0  # long NPT settle
-    REPORT_INT_STEPS = 1000  # report every 1000 steps (~1 ps at 1 fs)
-
-    PRE_EQ_STEPS = int(PRE_EQ_PS / TIMESTEP_PS)  # 50,000
-    EQ_STEPS = int(EQ_PS / TIMESTEP_PS)  # 950,000
-
     for job in TARGETS:
         name = job["name"]
-        smiles = job["smiles"]
 
-        # File paths for checkpoints / outputs
-        preeq_chk_path = OUT_DIR / f"{name}_{solvent_choice}_preeq.chk"
-        eq_chk_path = OUT_DIR / f"{name}_{solvent_choice}_eq.chk"
+        preeq_chk_path = OUT_DIR / f"{name}_{SOLVENT_CHOICE}_preeq.chk"
+        eq_chk_path = OUT_DIR / f"{name}_{SOLVENT_CHOICE}_eq.chk"
 
-        minimized_pdb_path = OUT_DIR / f"{name}_{solvent_choice}_minimized.pdb"
-        eq_pdb_path = OUT_DIR / f"{name}_{solvent_choice}_eq.pdb"
+        minimized_pdb_path = OUT_DIR / f"{name}_{SOLVENT_CHOICE}_minimized.pdb"
+        eq_pdb_path = OUT_DIR / f"{name}_{SOLVENT_CHOICE}_eq.pdb"
 
-        dcd_path = OUT_DIR / f"{name}_{solvent_choice}.dcd"
-        log_path = OUT_DIR / f"{name}_{solvent_choice}.log"
+        dcd_path = OUT_DIR / f"{name}_{SOLVENT_CHOICE}.dcd"
+        log_path = OUT_DIR / f"{name}_{SOLVENT_CHOICE}.log"
 
-        # ---------------------------
-        # 0. Build solvated system
-        # ---------------------------
+        # -------------------------------------------------
+        # 0. Build solvated system with restraints ON
+        # -------------------------------------------------
         sim = _build_solvated_sim(
-            solute_smiles=smiles,
-            solute_name=name,
-            solvent_kind=solvent_choice,
-            box_nm=box_nm,
+            job=job,
+            solvent_kind=SOLVENT_CHOICE,
+            box_nm=BOX_EDGE_NM,
         )
 
-        # ---------------------------
-        # 1. PRE-EQ phase
-        # ---------------------------
-        if os.path.exists(preeq_chk_path):
-            # resume from PRE_EQ checkpoint
+        # -------------------------------------------------
+        # 1. PRE-EQ (restrained solute heavy atoms)
+        # -------------------------------------------------
+        if preeq_chk_path.exists():
             with open(preeq_chk_path, "rb") as fh:
                 sim.context.loadCheckpoint(fh.read())
             print(f"[resume] {name}: loaded {preeq_chk_path.name}")
         else:
-            # fresh run: minimize then pre-equilibrate
+            # minimize (restraints active so solute won't distort)
             sim.minimizeEnergy()
             _write_snapshot_pdb_wrapped(sim, minimized_pdb_path)
 
-            # attach reporter for PRE_EQ
+            # reporter for PRE_EQ
             sim.reporters = [
                 StateDataReporter(
-                    sys.stdout,
+                    os.sys.stdout,
                     REPORT_INT_STEPS,
                     step=True,
                     progress=True,
@@ -529,24 +645,30 @@ def main():
 
             sim.step(PRE_EQ_STEPS)
 
-            # save checkpoint after PRE_EQ
+            # checkpoint after PRE_EQ
             with open(preeq_chk_path, "wb") as fh:
                 fh.write(sim.context.createCheckpoint())
             print(f"[checkpoint] {name}: wrote {preeq_chk_path.name}")
 
-        # ---------------------------
-        # 2. EQ phase (long NPT settle)
-        # ---------------------------
-        if os.path.exists(eq_chk_path):
-            # resume from EQ checkpoint
+        # -------------------------------------------------
+        # Turn OFF restraints before EQ
+        # -------------------------------------------------
+        sim.context.setParameter(
+            "k_restraint",
+            0.0 * unit.kilojoule_per_mole / (unit.nanometer ** 2),
+        )
+
+        # -------------------------------------------------
+        # 2. EQ (unrestrained NPT settle)
+        # -------------------------------------------------
+        if eq_chk_path.exists():
             with open(eq_chk_path, "rb") as fh:
                 sim.context.loadCheckpoint(fh.read())
             print(f"[resume] {name}: loaded {eq_chk_path.name}")
         else:
-            # continue from end of PRE_EQ into EQ
             sim.reporters = [
                 StateDataReporter(
-                    sys.stdout,
+                    os.sys.stdout,
                     REPORT_INT_STEPS,
                     step=True,
                     progress=True,
@@ -562,39 +684,31 @@ def main():
 
             sim.step(EQ_STEPS)
 
-            # snapshot at end of equilibration
             _write_snapshot_pdb_wrapped(sim, eq_pdb_path)
 
-            # save checkpoint after EQ
             with open(eq_chk_path, "wb") as fh:
                 fh.write(sim.context.createCheckpoint())
             print(f"[checkpoint] {name}: wrote {eq_chk_path.name}")
             print(f"[eq] {name}: wrote {eq_pdb_path.name}")
 
-        # ---------------------------
-        # 3. Production run (continuous trajectory)
-        # ---------------------------
-        # reporters for production:
+        # -------------------------------------------------
+        # 3. Production
+        # -------------------------------------------------
         sim.reporters = [
-            # live progress to stdout during production chunks
-            # (we'll overwrite this entry inside run_production_in_chunks)
-            # placeholder; run_production_in_chunks will mutate sim.reporters[0]
             StateDataReporter(
-                sys.stdout,
+                os.sys.stdout,
                 REPORT_INT_STEPS,
                 step=True,
                 progress=True,
                 remainingTime=True,
                 speed=True,
-                totalSteps=1,  # dummy; will get replaced per chunk
+                totalSteps=1,  # dummy, replaced per chunk
                 temperature=True,
                 potentialEnergy=True,
                 volume=True,
                 separator="\t",
             ),
-            # trajectory file (keeps appending frames)
             DCDReporter(str(dcd_path), REPORT_INT_STEPS),
-            # thermo log file
             StateDataReporter(
                 str(log_path),
                 REPORT_INT_STEPS,
@@ -606,11 +720,10 @@ def main():
             ),
         ]
 
-        # Now run geometric production chunks (1 ps, 10 ps, 100 ps, 1000 ps, ...)
         run_production_in_chunks(
             sim=sim,
             name=name,
-            solvent_choice=solvent_choice,
+            solvent_choice=SOLVENT_CHOICE,
             base_ps=1.0,
             multipliers=[1.0, 10.0, 100.0, 1000.0],
             timestep_ps=TIMESTEP_PS,
@@ -619,8 +732,7 @@ def main():
             log_path=log_path,
         )
 
-        print(f"[done] {name}: {dcd_path.name}, {log_path.name}, "
-              f"{eq_pdb_path.name} in {OUT_DIR}")
+        print(f"[done] {name}: {dcd_path.name}, {log_path.name}, {eq_pdb_path.name} in {OUT_DIR}")
 
 
 if __name__ == "__main__":
