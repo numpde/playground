@@ -1,0 +1,27 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fl-future-min"
+version = "0.0.1"
+requires-python = ">=3.9"
+dependencies = ["flwr", "torch", "numpy"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.flwr.app]
+publisher = "ra"
+
+[tool.flwr.app.components]
+serverapp = "server_app:app"
+clientapp = "client_app:app"
+
+[tool.flwr.federations]
+default = "local"
+
+[tool.flwr.federations.local]
+address = "127.0.0.1:9093"  # SuperLink Control API
+insecure = true
