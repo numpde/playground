@@ -338,19 +338,48 @@ def _build_solvated_sim(
     return sim
 
 
-def _write_snapshot_pdb(sim: Simulation, out_path: Path):
+def _write_snapshot_pdb_wrapped(sim, out_path):
     """
-    Dump current positions+topology into a PDB.
-    Use *_eq.pdb as the reference structure when loading the DCD in PyMOL.
+    Periodic imaging for nice visualization:
+    - keep every residue (water, solute) whole
+    - place each residue's center into the primary unit cell [0,L)
+    Assumes an orthorhombic box (diagonal box vectors).
     """
+    # grab positions and box
     state = sim.context.getState(getPositions=True)
-    with out_path.open("w") as f:
-        PDBFile.writeFile(
-            sim.topology,
-            state.getPositions(),
-            f,
-            keepIds=True,
-        )
+    pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)  # (N,3)
+    (avec, bvec, cvec) = sim.context.getState().getPeriodicBoxVectors(asNumpy=True)
+
+    box_lengths = np.array([
+        avec[0].value_in_unit(unit.nanometer),
+        bvec[1].value_in_unit(unit.nanometer),
+        cvec[2].value_in_unit(unit.nanometer),
+    ])  # [Lx, Ly, Lz] nm
+
+    # we'll build a new coord array we can edit
+    wrapped_nm = np.zeros_like(pos_nm)
+
+    # iterate residues (each water is its own residue; solute should be one residue)
+    top = sim.topology
+    for res in top.residues():
+        # collect atom indices for this residue
+        idxs = [atom.index for atom in res.atoms()]
+        coords = pos_nm[idxs, :]  # (n_res_atoms,3)
+
+        # compute residue "center"
+        center = coords.mean(axis=0)  # nm
+
+        # wrap center into primary cell
+        center_wrapped = center - np.floor(center / box_lengths) * box_lengths
+
+        # shift all atoms by the same delta
+        shift = center_wrapped - center
+        wrapped_nm[idxs, :] = coords + shift
+
+    # convert back to OpenMM Quantity and write PDB
+    wrapped_q = wrapped_nm * unit.nanometer
+    with open(out_path, "w") as fh:
+        PDBFile.writeFile(top, wrapped_q, fh, keepIds=True)
 
 
 def run_production_in_chunks(
@@ -424,27 +453,25 @@ def run_production_in_chunks(
 
         # checkpoint snapshot after this chunk
         chk_path = OUT_DIR / f"{name}_{solvent_choice}_chk_{int(chunk_ps)}ps.pdb"
-        _write_snapshot_pdb(sim, chk_path)
+        _write_snapshot_pdb_wrapped(sim, chk_path)
         print(f"[checkpoint] {name} {solvent_choice} @ +{chunk_ps} ps -> {chk_path.name}")
 
 
 # ---------- main ----------
 
 def main():
-    import sys, os
-
-    solvent_choice = "water"   # "water", "dmso", "cdcl3"
-    box_nm = 3.0               # nm cube edge
+    solvent_choice = "water"  # "water", "dmso", "cdcl3"
+    box_nm = 3.0  # nm cube edge
 
     # timestep = 1 fs = 0.001 ps
     TIMESTEP_PS = 0.001
 
-    PRE_EQ_PS = 50.0     # short pre-equilibration
-    EQ_PS     = 950.0    # long NPT settle
+    PRE_EQ_PS = 50.0  # short pre-equilibration
+    EQ_PS = 950.0  # long NPT settle
     REPORT_INT_STEPS = 1000  # report every 1000 steps (~1 ps at 1 fs)
 
-    PRE_EQ_STEPS = int(PRE_EQ_PS / TIMESTEP_PS)   # 50,000
-    EQ_STEPS     = int(EQ_PS     / TIMESTEP_PS)   # 950,000
+    PRE_EQ_STEPS = int(PRE_EQ_PS / TIMESTEP_PS)  # 50,000
+    EQ_STEPS = int(EQ_PS / TIMESTEP_PS)  # 950,000
 
     for job in TARGETS:
         name = job["name"]
@@ -452,10 +479,10 @@ def main():
 
         # File paths for checkpoints / outputs
         preeq_chk_path = OUT_DIR / f"{name}_{solvent_choice}_preeq.chk"
-        eq_chk_path    = OUT_DIR / f"{name}_{solvent_choice}_eq.chk"
+        eq_chk_path = OUT_DIR / f"{name}_{solvent_choice}_eq.chk"
 
         minimized_pdb_path = OUT_DIR / f"{name}_{solvent_choice}_minimized.pdb"
-        eq_pdb_path        = OUT_DIR / f"{name}_{solvent_choice}_eq.pdb"
+        eq_pdb_path = OUT_DIR / f"{name}_{solvent_choice}_eq.pdb"
 
         dcd_path = OUT_DIR / f"{name}_{solvent_choice}.dcd"
         log_path = OUT_DIR / f"{name}_{solvent_choice}.log"
@@ -481,7 +508,7 @@ def main():
         else:
             # fresh run: minimize then pre-equilibrate
             sim.minimizeEnergy()
-            _write_snapshot_pdb(sim, minimized_pdb_path)
+            _write_snapshot_pdb_wrapped(sim, minimized_pdb_path)
 
             # attach reporter for PRE_EQ
             sim.reporters = [
@@ -536,7 +563,7 @@ def main():
             sim.step(EQ_STEPS)
 
             # snapshot at end of equilibration
-            _write_snapshot_pdb(sim, eq_pdb_path)
+            _write_snapshot_pdb_wrapped(sim, eq_pdb_path)
 
             # save checkpoint after EQ
             with open(eq_chk_path, "wb") as fh:
