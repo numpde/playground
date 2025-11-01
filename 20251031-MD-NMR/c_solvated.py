@@ -365,7 +365,7 @@ def _build_solvated_sim(
       (restraints active initially, will be turned off after PRE_EQ)
 
     Returns:
-      Simulation (CPU platform, multithreaded)
+      Simulation (GPU if available via CUDA/HIP/OpenCL, else multithreaded CPU)
     """
 
     name = job["name"]
@@ -467,10 +467,37 @@ def _build_solvated_sim(
         TIMESTEP_PS * unit.picoseconds,
     )
 
-    # multithreaded CPU platform
-    platform = openmm.Platform.getPlatformByName("CPU")
-    n_threads = os.cpu_count() or 1
-    platform_props = {"Threads": str(n_threads)}
+    # --- choose best available OpenMM platform
+    platform = None
+    platform_name = None
+    for cand in ("CUDA", "HIP", "OpenCL", "CPU"):
+        try:
+            platform = openmm.Platform.getPlatformByName(cand)
+            platform_name = cand
+            break
+        except Exception:
+            continue
+
+    if platform is None:
+        raise RuntimeError("No valid OpenMM platform found (CUDA/HIP/OpenCL/CPU).")
+
+    # platform-specific properties
+    if platform_name in ("CUDA", "HIP"):
+        # mixed precision = good balance of speed/stability
+        platform_props = {"Precision": "mixed"}
+        print(f"[info] using {platform_name} platform (GPU, mixed precision)")
+    elif platform_name == "OpenCL":
+        # 'single' is widely supported across OpenCL devices
+        platform_props = {"Precision": "single"}
+        print(f"[info] using {platform_name} platform (accelerator/OpenCL, single precision)")
+    elif platform_name == "CPU":
+        n_threads = os.cpu_count() or 1
+        platform_props = {"Threads": str(n_threads)}
+        print(f"[info] using {platform_name} platform with {n_threads} threads")
+    else:
+        # Fallback safety branch; usually not hit
+        platform_props = {}
+        print(f"[info] using {platform_name} platform (no special properties)")
 
     # Simulation
     top_omm = top_off.to_openmm()
@@ -493,7 +520,8 @@ def _build_solvated_sim(
     sim.context.setPeriodicBoxVectors(a_vec, b_vec, c_vec)
 
     # By default PRE_EQ_RESTRAINT_K is active.
-    # We'll later set it to 0 after PRE_EQ via sim.context.setParameter("k_restraint", 0*...)
+    # We'll later set it to 0 after PRE_EQ via:
+    # sim.context.setParameter("k_restraint", 0*unit.kilojoule_per_mole/unit.nanometer**2)
     return sim
 
 
