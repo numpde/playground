@@ -1,64 +1,49 @@
 # /home/ra/repos/playground/20251031-MD-NMR/f_predict_shifts.py
-# Timestamp: 2025-11-01 16:00 Africa/Nairobi
+# Timestamp: 2025-11-01 17:45 Africa/Nairobi
 #
-# Summary
-# -------
-# Step f: predict NMR shifts (1H / 13C) for each solute "tag" clustered
-# in e_cluster/ and write:
-#   f_predict_shifts/<tag>_cluster_<cid>_shifts.tsv      (per-cluster)
-#   f_predict_shifts/<tag>_fastavg_shifts.tsv            (population/Boltz)
-#   f_predict_shifts/<tag>_params.txt                    (provenance)
+# Step f: predict NMR shifts (1H/13C) from clustered conformers.
+# Outputs per tag:
+#   f_predict_shifts/<tag>_cluster_<cid>_shifts.tsv
+#   f_predict_shifts/<tag>_fastavg_shifts.tsv
+#   f_predict_shifts/<tag>_params.txt
 #
-# New in this revision
-# --------------------
-# - Temperature-aware Boltzmann reweighting:
-#     weights_i(T) ∝ exp( -(G_i - G_min) / (k_B T) )
-#   where G_i is approximated by a single-point electronic energy with PCM ON
-#   at the (optionally PCM-relaxed) geometry. Toggle with:
-#     --temp 298.15            (temperature in K; default 298.15)
-#     --eps  46.7              (PCM dielectric; default 46.7 e.g., DMSO)
-#     --no-boltz               (stick to MD cluster fractions)
-#
-# - Robust cluster table loader; graceful fallbacks for medoid PDB paths.
-# - Clear, minimal logging; unchanged fast-exchange assumption.
-#
-# Mechanistic note
-# ----------------
-# This step assumes "fast exchange", so the observable shift is a population
-# average over conformers:
-#     <δ> = Σ_i w_i(T) · δ_i
-# where δ_i are per-atom shifts from GIAO shielding and w_i are either:
-#   (A) the MD cluster fractions (original behavior), or
-#   (B) Boltzmann weights at temperature T (new; default ON).
-#
-# Caveats
-# -------
-# - PCM is used for geometry (if --opt) and for single-point energies G_i(T).
-#   For NMR, PySCF's PCM wrapping is not supported by pyscf.prop.nmr, so
-#   shieldings are computed from a gas-phase SCF at the frozen geometry.
-# - Reference uses TMS computed at the same electronic level (gas-phase SCF).
-# - If exchange slows at low T (k_ex ~ Δω), expect line splitting in real
-#   spectra; inspect per-cluster TSVs rather than the fastavg.
-#
-# Source: user’s original f_predict_shifts.py (revised end-to-end).
-# ---------------------------------------------------------------------
+# Features
+# - Representatives: e_cluster/<tag>_cluster_<cid>_rep.pdb
+# - Fast-exchange average; optional Boltzmann reweighting by temperature.
+# - Shieldings from PySCF NMR (robust to API differences across versions).
+# - TMS reference at same electronic level.
+# - Optional pandas TSV loader; falls back to csv.
+# - Suppresses PySCF “under testing / not fully tested” warnings.
 
 from __future__ import annotations
 
 import argparse
 import csv
 import math
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-# PySCF core
-from pyscf import gto, dft
-from pyscf.prop import nmr as pyscf_nmr
 
-# Optional geometry optimization via geomeTRIC
+# Optional pandas
+try:
+    import pandas as pd  # type: ignore
+
+    _HAS_PANDAS = True
+except Exception:
+    _HAS_PANDAS = False
+
+# ── Silence PySCF "prop under testing" warnings (keep real errors visible) ──
+warnings.filterwarnings("ignore", message=r"Module .* is under testing", category=UserWarning)
+warnings.filterwarnings("ignore", message=r"Module .* is not fully tested", category=UserWarning)
+
+# PySCF
+from pyscf import gto, dft
+
+# Optional geometry optimization
 try:
     from pyscf.geomopt.geomeTRIC import optimize as geom_optimize
 
@@ -66,28 +51,23 @@ try:
 except Exception:
     GEOMOPT_AVAILABLE = False
 
-# -----------------------------
-# Tunables (can be CLI-overridden)
-# -----------------------------
+# ── Tunables (CLI-overridable) ────────────────────────────────────────────────
 DFT_XC_DEFAULT = "b3lyp"
 BASIS_DEFAULT = "def2-tzvp"
 SCF_MAXCYC = 200
 SCF_CONV_TOL = 1e-9
-GRAD_CONV_TOL = 3e-4  # ~geomeTRIC default scale
-NMR_NUCLEI = ("H", "C")  # only report 1H/13C
+GRAD_CONV_TOL = 3e-4
 
 OUT_DIR = Path("f_predict_shifts")
 CLUSTERS_DIR = Path("e_cluster")
 
-PCM_EPS_DEFAULT = 46.7  # DMSO at ~298 K (you may choose to vary with T)
-DO_GEOM_OPT_DEFAULT = True  # optimize medoids (PCM ON)
-USE_BOLTZMANN_WEIGHTS_DEFAULT = True
+PCM_EPS_DEFAULT = 46.7  # DMSO ~298 K
 TEMPERATURE_K_DEFAULT = 298.15
+DO_GEOM_OPT_DEFAULT = True
+USE_BOLTZMANN_WEIGHTS_DEFAULT = True
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# ── Utils ────────────────────────────────────────────────────────────────────
 def _mkdir_p(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
@@ -96,9 +76,7 @@ def _fmt(x: float) -> str:
     return f"{x:.6f}" if np.isfinite(x) else "nan"
 
 
-# -----------------------------
-# Chemistry helpers
-# -----------------------------
+# ── Chemistry helpers ────────────────────────────────────────────────────────
 def _make_mol(symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: int) -> gto.Mole:
     mol = gto.Mole()
     mol.build(
@@ -106,31 +84,25 @@ def _make_mol(symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: i
         unit="Angstrom",
         basis=BASIS_DEFAULT,
         charge=charge,
-        spin=spin,  # 2S; closed-shell: 0
+        spin=spin,
         verbose=0,
     )
     return mol
 
 
-def _build_rks_or_uks(mol: gto.Mole, xc: str) -> dft.rks.RKS | dft.uks.UKS:
-    if mol.spin == 0:
-        mf = dft.RKS(mol)
-    else:
-        mf = dft.UKS(mol)
+def _build_rks_or_uks(mol: gto.Mole, xc: str):
+    mf = dft.RKS(mol) if mol.spin == 0 else dft.UKS(mol)
     mf.xc = xc
     mf.max_cycle = SCF_MAXCYC
     mf.conv_tol = SCF_CONV_TOL
     return mf
 
 
-def _attach_pcm_and_build_scf(mol: gto.Mole, xc: str, solvent_eps: Optional[float],
-                              use_pcm: bool) -> dft.rks.RKS | dft.uks.UKS:
+def _attach_pcm_and_build_scf(mol: gto.Mole, xc: str, solvent_eps: Optional[float], use_pcm: bool):
     mf = _build_rks_or_uks(mol, xc)
     if use_pcm and (solvent_eps is not None):
-        # Simple dCOSMO-like wrapper; PySCF's `solvent` module auto-wraps MF.
-        # NOTE: this MF cannot be passed into pyscf.prop.nmr
         try:
-            from pyscf import solvent as pyscf_solvent  # lazy import
+            from pyscf import solvent as pyscf_solvent
             mf = pyscf_solvent.ddCOSMO(mf)
             mf.with_solvent.eps = float(solvent_eps)
         except Exception as e:
@@ -138,106 +110,138 @@ def _attach_pcm_and_build_scf(mol: gto.Mole, xc: str, solvent_eps: Optional[floa
     return mf
 
 
-def _optimize_geometry_pcm(symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: int, xc: str,
-                           solvent_eps: Optional[float]) -> np.ndarray:
+def _optimize_geometry_pcm(
+        symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: int, xc: str, solvent_eps: Optional[float]
+) -> np.ndarray:
     if not GEOMOPT_AVAILABLE:
         print("[info] geomeTRIC not available; skipping geometry optimization.")
         return coords_A
-
     mol = _make_mol(symbols, coords_A, charge=charge, spin=spin)
     mf_pcm = _attach_pcm_and_build_scf(mol, xc=xc, solvent_eps=solvent_eps, use_pcm=True)
     try:
-        e_opt, mol_opt = geom_optimize(mf_pcm, tol=GRAD_CONV_TOL, maxsteps=200, callback=None)
-        # Pull Angstrom coordinates back
+        _e_opt, mol_opt = geom_optimize(mf_pcm, tol=GRAD_CONV_TOL, maxsteps=200, callback=None)
         coords_bohr = mol_opt.atom_coords(unit="Bohr")
-        coords_A_new = coords_bohr * 0.529177210903
-        return coords_A_new
+        return coords_bohr * 0.529177210903
     except Exception as e:
         print(f"[warn] geometry optimization failed: {e}; using input geometry.")
         return coords_A
 
 
+# ── PySCF NMR (version-robust) ───────────────────────────────────────────────
+def _nmr_tensors_from_mf(mf) -> np.ndarray:
+    """
+    Return per-atom 3x3 shielding tensors from a PySCF mean-field object.
+    Tries several API locations to support multiple PySCF versions:
+      - from pyscf.prop.nmr import NMR
+      - from pyscf.prop.nmr import rhf/uhf/rks/uks → NMR
+      - method on mf: mf.NMR()
+    Raises a clear error with hints if none are available.
+    """
+    # 1) Unified NMR class
+    try:
+        from pyscf.prop.nmr import NMR  # type: ignore
+        return NMR(mf).kernel()
+    except Exception:
+        pass
+
+    # 2) Method on mf (some builds expose this)
+    try:
+        if hasattr(mf, "NMR"):
+            return mf.NMR().kernel()
+    except Exception:
+        pass
+
+    # 3) Flavor-specific modules
+    try:
+        from pyscf.prop import nmr as nmrmod  # type: ignore
+        # DFT vs HF decided by mf class; spin via mf.mol.spin
+        if isinstance(mf, dft.rks.RKS):
+            if hasattr(nmrmod, "rks"):
+                return nmrmod.rks.NMR(mf).kernel()
+        if isinstance(mf, dft.uks.UKS):
+            if hasattr(nmrmod, "uks"):
+                return nmrmod.uks.NMR(mf).kernel()
+        # Fallbacks if DFT-specific not present — try RHF/UHF wrappers
+        if hasattr(nmrmod, "rhf") and mf.mol.spin == 0:
+            return nmrmod.rhf.NMR(mf).kernel()
+        if hasattr(nmrmod, "uhf") and mf.mol.spin != 0:
+            return nmrmod.uhf.NMR(mf).kernel()
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "PySCF NMR interface not found in this environment. "
+        "Tried: pyscf.prop.nmr.NMR, nmr.rks/uks/rhf/uhf.NMR, and mf.NMR(). "
+        "Please ensure PySCF's property modules are installed/enabled."
+    )
+
+
 def _sigma_iso_from_tensors(tensors: np.ndarray) -> np.ndarray:
-    # tensors shape: (natm, 3, 3); isotropic shielding = trace/3
-    iso = np.trace(tensors, axis1=1, axis2=2) / 3.0
-    return iso.astype(float)
+    return (np.trace(tensors, axis1=1, axis2=2) / 3.0).astype(float)
 
 
-def _compute_sigma_iso(symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: int, xc: str) -> np.ndarray:
-    # NMR requires gas-phase mf (PCM-wrapped MF not supported by pyscf.prop.nmr)
+def _compute_sigma_iso(symbols, coords_A, charge, spin, xc):
     mol = _make_mol(symbols, coords_A, charge=charge, spin=spin)
     mf = _build_rks_or_uks(mol, xc=xc)
     _ = mf.kernel()
+    tensors = _nmr_tensors_from_mf(mf)
+
+    # Accept multiple return shapes across PySCF versions:
+    # - (natm, 3, 3): full shielding tensors
+    # - (natm,): isotropic shieldings already
+    # - (natm, 3): principal values → take mean
+    arr = np.asarray(tensors)
+    if arr.ndim == 3 and arr.shape[-1] == 3 and arr.shape[-2] == 3:
+        return (np.trace(arr, axis1=1, axis2=2) / 3.0).astype(float)
+    if arr.ndim == 1:
+        return arr.astype(float)
+    if arr.ndim == 2 and arr.shape[1] == 3:
+        return arr.mean(axis=1).astype(float)
+
+    # Last-resort: try diagonal mean if it looks square-ish
     try:
-        nmr = pyscf_nmr.NMR(mf)
-        tensors = nmr.kernel()  # array per-atom (3x3)
-        if isinstance(tensors, np.ndarray) and tensors.ndim == 3:
-            return _sigma_iso_from_tensors(tensors)
-    except NotImplementedError:
-        pass  # fallthrough to diagonal mean below
-    # Fallback: if something odd is returned, take diagonal mean per atom
-    # (not expected for current PySCF, but keeps code robust)
-    try:
-        diag = np.diagonal(tensors, axis1=-2, axis2=-1).mean(axis=-1)
+        diag = np.diagonal(arr, axis1=-2, axis2=-1).mean(axis=-1)
         return diag.astype(float)
     except Exception:
-        raise RuntimeError("Unexpected NMR tensor format from PySCF.")
+        raise RuntimeError(f"Unrecognized NMR output shape: {arr.shape}")
 
 
 def _sigma_to_delta_ppm(symbols: Sequence[str], sigma_iso: np.ndarray, ref_sigma: Dict[str, float]) -> np.ndarray:
-    # δ = σ_ref(element) - σ_i for 1H/13C; NaN for other elements
-    out = np.full_like(sigma_iso, fill_value=np.nan, dtype=float)
+    out = np.full_like(sigma_iso, np.nan, dtype=float)
     for i, el in enumerate(symbols):
-        key = "H" if el.upper() == "H" else ("C" if el.upper() == "C" else None)
-        if key is not None and key in ref_sigma:
-            out[i] = ref_sigma[key] - sigma_iso[i]
+        elU = el.upper()
+        if elU in ("H", "C"):
+            out[i] = ref_sigma[elU] - sigma_iso[i]
     return out
 
 
 def _tms_geometry() -> Tuple[List[str], np.ndarray]:
-    # Minimal TMS geometry (Si(CH3)4) in Angstrom, tetrahedral; rough, good enough
-    # for consistent referencing as long as level is the same across calls.
-    # Si at origin; four methyl carbons roughly tetrahedral; hydrogens extended.
-    # This is intentionally simple; exact geometry is not critical for a reference.
     symbols: List[str] = []
     coords: List[Tuple[float, float, float]] = []
 
-    def add(atom: str, x: float, y: float, z: float) -> None:
-        symbols.append(atom)
+    def add(a: str, x: float, y: float, z: float) -> None:
+        symbols.append(a);
         coords.append((x, y, z))
 
     add("Si", 0.0, 0.0, 0.0)
-
-    R_SiC = 1.86
-    R_CH = 1.09
-    # Tetrahedral directions
-    dirs = [
-        (1, 1, 1),
-        (-1, -1, 1),
-        (-1, 1, -1),
-        (1, -1, -1),
-    ]
+    R_SiC, R_CH = 1.86, 1.09
+    dirs = [(1, 1, 1), (-1, -1, 1), (-1, 1, -1), (1, -1, -1)]
     for dx, dy, dz in dirs:
-        norm = (dx * dx + dy * dy + dz * dz) ** 0.5
-        ux, uy, uz = dx / norm, dy / norm, dz / norm
+        n = (dx * dx + dy * dy + dz * dz) ** 0.5
+        ux, uy, uz = dx / n, dy / n, dz / n
         cx, cy, cz = R_SiC * ux, R_SiC * uy, R_SiC * uz
         add("C", cx, cy, cz)
-        # Place three H's around each C in a trigonal pattern perpendicular to the C–Si bond
-        # Quick orthonormal frame:
         ax, ay, az = -ux, -uy, -uz
-        # arbitrary perpendicular vectors
         if abs(ax) < 0.9:
             px, py, pz = 1.0, 0.0, 0.0
         else:
             px, py, pz = 0.0, 1.0, 0.0
-        # Gram-Schmidt
         vx, vy, vz = px - (ax * px + ay * py + az * pz) * ax, py - (ax * px + ay * py + az * pz) * ay, pz - (
                     ax * px + ay * py + az * pz) * az
-        vnorm = (vx * vx + vy * vy + vz * vz) ** 0.5
-        vx, vy, vz = vx / vnorm, vy / vnorm, vz / vnorm
-        wx, wy, wz = ay * vz - az * vy, az * vx - ax * vz, ax * vy - ay * vx  # a×v
-
-        for ang in (0.0, 2.0943951023931953, 4.1887902047863905):  # 0, 120°, 240°
+        vn = (vx * vx + vy * vy + vz * vz) ** 0.5
+        vx, vy, vz = vx / vn, vy / vn, vz / vn
+        wx, wy, wz = ay * vz - az * vy, az * vx - ax * vz, ax * vy - ay * vx
+        for ang in (0.0, 2.0943951023931953, 4.1887902047863905):
             hx = cx + R_CH * (0.6 * ax + 0.8 * (math.cos(ang) * vx + math.sin(ang) * wx))
             hy = cy + R_CH * (0.6 * ay + 0.8 * (math.cos(ang) * vy + math.sin(ang) * wy))
             hz = cz + R_CH * (0.6 * az + 0.8 * (math.cos(ang) * vz + math.sin(ang) * wz))
@@ -248,103 +252,167 @@ def _tms_geometry() -> Tuple[List[str], np.ndarray]:
 
 @lru_cache(maxsize=1)
 def _tms_ref_sigma(xc: str) -> Dict[str, float]:
-    # Build TMS, optionally PCM-relax it (same as solute), but final NMR stays gas-phase.
     symbols, coords_A = _tms_geometry()
     mol = _make_mol(symbols, coords_A, charge=0, spin=0)
     mf = _build_rks_or_uks(mol, xc=xc)
     _ = mf.kernel()
-    nmr = pyscf_nmr.NMR(mf)
-    tensors = nmr.kernel()
+    tensors = _nmr_tensors_from_mf(mf)
     sigma = _sigma_iso_from_tensors(tensors)
-    # Return element-averaged σ_ref for H and C (averaging all H, all C in TMS)
-    ref: Dict[str, float] = {}
-    for el in ("H", "C"):
-        sel = [i for i, s in enumerate(symbols) if s.upper() == el]
-        ref[el] = float(np.mean(sigma[sel])) if sel else float("nan")
-    return ref
+    return {
+        "H": float(np.mean(sigma[[i for i, s in enumerate(symbols) if s.upper() == "H"]])),
+        "C": float(np.mean(sigma[[i for i, s in enumerate(symbols) if s.upper() == "C"]])),
+    }
 
 
-# -----------------------------
-# Energetics for Boltzmann weights
-# -----------------------------
-def _single_point_energy_pcm(symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: int, xc: str,
-                             solvent_eps: Optional[float]) -> float:
-    """PCM single-point electronic energy at fixed geometry (Hartree)."""
+# ── Energetics for Boltzmann weights ─────────────────────────────────────────
+def _single_point_energy_pcm(
+        symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: int, xc: str, solvent_eps: Optional[float]
+) -> float:
     mol = _make_mol(symbols, coords_A, charge=charge, spin=spin)
     mf = _attach_pcm_and_build_scf(mol, xc=xc, solvent_eps=solvent_eps, use_pcm=True)
-    e_tot = float(mf.kernel())
-    return e_tot
+    return float(mf.kernel())
 
 
 def _boltzmann_weights_from_energies(E_hartree: Sequence[float], temp_K: float) -> np.ndarray:
-    """Return normalized Boltzmann weights at T for energy list in Hartree."""
     kB_Ha_per_K = 3.166811563e-6
     E = np.array(E_hartree, dtype=float)
     Emin = float(np.min(E))
     beta = 1.0 / (kB_Ha_per_K * temp_K)
     x = -beta * (E - Emin)
-    x -= np.max(x)  # stabilize
+    x -= np.max(x)
     w = np.exp(x)
     return (w / np.sum(w)).astype(float)
 
 
-# -----------------------------
-# I/O: clusters and medoids
-# -----------------------------
+# ── I/O: clusters & representatives ──────────────────────────────────────────
 @dataclass
 class ClusterRow:
     cid: int
     fraction: float
-    medoid_pdb: Path
+    rep_pdb: Path
 
 
-def _guess_medoid_path(tag: str, cid: int) -> Path:
-    # Common patterns; adjust as needed to match your pipeline
-    cand = [
-        CLUSTERS_DIR / f"{tag}_cluster_{cid}_medoid.pdb",
-        CLUSTERS_DIR / f"{tag}_cluster{cid}_medoid.pdb",
-        CLUSTERS_DIR / f"{tag}_c{cid}_medoid.pdb",
-    ]
-    for p in cand:
-        if p.exists():
-            return p
-    # Fallback: last resort — any PDB matching tag & cid
-    for p in CLUSTERS_DIR.glob(f"*{tag}*{cid}*medoid*.pdb"):
+def _guess_rep_path(tag: str, cid: int) -> Path:
+    p = CLUSTERS_DIR / f"{tag}_cluster_{cid}_rep.pdb"
+    if p.exists():
         return p
-    raise FileNotFoundError(f"No medoid PDB found for tag={tag} cid={cid}")
+    for name in (
+            f"{tag}_cluster{cid}_rep.pdb",
+            f"{tag}_c{cid}_rep.pdb",
+            f"{tag}_cluster_{cid}_representative.pdb",
+            f"{tag}_cluster_{cid}.pdb",
+    ):
+        q = CLUSTERS_DIR / name
+        if q.exists():
+            return q
+    for pat in (f"{tag}_cluster_{cid}_*rep*.pdb", f"{tag}*cluster*{cid}*rep*.pdb"):
+        for q in CLUSTERS_DIR.glob(pat):
+            return q
+    examples = sorted(CLUSTERS_DIR.glob(f"{tag}_cluster_*_rep.pdb"))[:10]
+    hint = "\n".join(f"  - {x.name}" for x in examples) or "  (no matching files)"
+    raise FileNotFoundError(
+        f"No rep PDB found for tag={tag} cid={cid}\n"
+        f"Looked for: {tag}_cluster_{cid}_rep.pdb\n"
+        f"Nearby examples:\n{hint}"
+    )
 
 
+# ── TSV loader (pandas if available; else csv) ───────────────────────────────
 def _load_clusters_table(path: Path, tag: str) -> List[ClusterRow]:
+    CID_COLS = ["cid", "cluster_id", "cluster"]
+    FRAC_COLS = ["fraction", "weight", "pop", "pop_frac"]
+    REP_COLS = ["rep", "pdb", "path", "rep_path", "representative", "medoid", "medoid_path"]
+
+    def _norm(s: str) -> str:
+        return s.strip().lower().replace(" ", "_")
+
+    def _pick(series_names: List[str], candidates: List[str]) -> Optional[str]:
+        sset = {_norm(x) for x in series_names}
+        for c in candidates:
+            if _norm(c) in sset:
+                for x in series_names:
+                    if _norm(x) == _norm(c):
+                        return x
+        return None
+
     rows: List[ClusterRow] = []
-    with path.open("r", newline="") as fh:
-        reader = csv.reader(fh, delimiter="\t")
-        header = None
-        for ln in reader:
-            if not ln or ln[0].startswith("#"):
-                continue
-            if header is None and any(x in ln for x in ("cid", "fraction", "medoid")):
-                header = [x.strip().lower() for x in ln]
-                continue
-            if header is None:
-                # assume compact TSV: cid  fraction
-                cid = int(ln[0])
-                frac = float(ln[1])
-                med = _guess_medoid_path(tag, cid)
+
+    if _HAS_PANDAS:
+        df = pd.read_csv(path, sep="\t", comment="#", dtype=str, keep_default_na=False)
+        cols = list(df.columns)
+        cid_name = _pick(cols, CID_COLS)
+        frac_name = _pick(cols, FRAC_COLS)
+        rep_name = _pick(cols, REP_COLS)
+
+        if cid_name is None:
+            # Treat as headerless: first two columns are cid, fraction
+            df = pd.read_csv(path, sep="\t", comment="#", header=None, dtype=str, keep_default_na=False)
+            df = df.dropna(how="all")
+            if df.shape[1] < 2:
+                raise ValueError(f"[{path.name}] Need at least two columns (cid, fraction).")
+            df.columns = ["cid", "fraction"] + [f"extra_{i}" for i in range(df.shape[1] - 2)]
+            cid_name, frac_name, rep_name = "cid", "fraction", None
+        else:
+            ren = {}
+            ren[cid_name] = "cid"
+            if frac_name: ren[frac_name] = "fraction"
+            if rep_name:  ren[rep_name] = "rep_path"
+            if ren:
+                df = df.rename(columns=ren)
+
+        # Coerce types
+        try:
+            cid_vals = pd.to_numeric(df["cid"], errors="raise")
+        except Exception as e:
+            bad = df["cid"].iloc[0] if not df.empty else "<empty>"
+            raise ValueError(f"[{path.name}] Non-numeric cid value like '{bad}'.") from e
+
+        frac_vals = None
+        if "fraction" in df.columns:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                frac_vals = pd.to_numeric(df["fraction"], errors="coerce")
+
+        rep_vals = df["rep_path"] if "rep_path" in df.columns else None
+
+        for i in range(len(df)):
+            cid = int(cid_vals.iloc[i])
+            frac = float(frac_vals.iloc[i]) if (frac_vals is not None and pd.notna(frac_vals.iloc[i])) else float("nan")
+            if rep_vals is not None and isinstance(rep_vals.iloc[i], str) and rep_vals.iloc[i].strip():
+                rp = rep_vals.iloc[i].strip()
+                rep = Path(rp).resolve() if Path(rp).is_absolute() else (path.parent / rp).resolve()
             else:
-                vals = {k: v for k, v in zip(header, ln)}
-                cid = int(vals.get("cid") or vals.get("cluster_id"))
-                frac = float(vals.get("fraction") or vals.get("frac") or vals.get("weight") or "0")
-                medtxt = vals.get("medoid") or vals.get("pdb") or ""
-                med = Path(medtxt) if medtxt else _guess_medoid_path(tag, cid)
-            rows.append(ClusterRow(cid=cid, fraction=frac, medoid_pdb=med))
-    if not rows:
-        raise RuntimeError(f"Cluster table is empty: {path}")
+                rep = _guess_rep_path(tag, cid)
+            rows.append(ClusterRow(cid=cid, fraction=frac, rep_pdb=rep))
+
+    else:
+        with path.open("r", newline="") as fh:
+            r = csv.reader(fh, delimiter="\t")
+            for ln in r:
+                if not ln or ln[0].lstrip().startswith("#"):
+                    continue
+                # assume headerless: cid, fraction[, rep]
+                try:
+                    cid = int(float(ln[0]))
+                except Exception as e:
+                    raise ValueError(f"[{path.name}] Expected numeric cid in first column, got {ln[0]!r}") from e
+                frac = float(ln[1]) if len(ln) > 1 and ln[1] != "" else float("nan")
+                rep = Path(ln[2]).resolve() if len(ln) > 2 and ln[2] != "" else _guess_rep_path(tag, cid)
+                if not rep.is_absolute():
+                    rep = (path.parent / rep).resolve()
+                rows.append(ClusterRow(cid=cid, fraction=frac, rep_pdb=rep))
+
+    # Equal-weight missing/NaN fractions
+    fracs = np.array([row.fraction for row in rows], dtype=float)
+    if not np.all(np.isfinite(fracs)):
+        n = len(rows)
+        for row in rows:
+            row.fraction = 1.0 / n
+
     return rows
 
 
-# -----------------------------
-# Minimal PDB reader (no heavy deps)
-# -----------------------------
+# ── Minimal PDB reader ───────────────────────────────────────────────────────
 def _read_pdb_atoms(pdb_path: Path) -> Tuple[List[str], List[str], np.ndarray]:
     atom_names: List[str] = []
     symbols: List[str] = []
@@ -354,36 +422,32 @@ def _read_pdb_atoms(pdb_path: Path) -> Tuple[List[str], List[str], np.ndarray]:
             if line.startswith(("ATOM", "HETATM")):
                 name = line[12:16].strip()
                 el = line[76:78].strip() or name[0]
-                x = float(line[30:38])
-                y = float(line[38:46])
+                x = float(line[30:38]);
+                y = float(line[38:46]);
                 z = float(line[46:54])
-                atom_names.append(name)
-                symbols.append(el)
+                atom_names.append(name);
+                symbols.append(el);
                 coords.append((x, y, z))
     if not atom_names:
         raise RuntimeError(f"No atoms parsed from {pdb_path}")
     return atom_names, symbols, np.array(coords, dtype=float)
 
 
-# -----------------------------
-# Charge/spin per tag (override as needed)
-# -----------------------------
+# ── Charge/spin per tag ──────────────────────────────────────────────────────
 def _get_charge_spin_for_tag(tag: str) -> Tuple[int, int]:
-    # Adjust for specific protonation/charge states by tag substring
     t = tag.lower()
     if "deprot" in t or "anion" in t:
         return (-1, 0)
     if "cation" in t or "prot" in t:
         return (+1, 0)
-    # defaults
     return (0, 0)
 
 
-# -----------------------------
-# Writers
-# -----------------------------
-def _write_cluster_shifts(out_dir: Path, tag: str, cid: int, atom_names: Sequence[str], atom_symbols: Sequence[str],
-                          sigma_iso: np.ndarray, delta_ppm: np.ndarray) -> Path:
+# ── Writers ──────────────────────────────────────────────────────────────────
+def _write_cluster_shifts(
+        out_dir: Path, tag: str, cid: int, atom_names: Sequence[str], atom_symbols: Sequence[str],
+        sigma_iso: np.ndarray, delta_ppm: np.ndarray
+) -> Path:
     out_path = out_dir / f"{tag}_cluster_{cid}_shifts.tsv"
     with out_path.open("w") as fh:
         fh.write("# atom_idx\tatom_name\telement\tsigma_iso\tshift_ppm\n")
@@ -392,8 +456,9 @@ def _write_cluster_shifts(out_dir: Path, tag: str, cid: int, atom_names: Sequenc
     return out_path
 
 
-def _write_fastavg_shifts(out_dir: Path, tag: str, atom_names: Sequence[str], atom_symbols: Sequence[str],
-                          delta_ppm: np.ndarray) -> Path:
+def _write_fastavg_shifts(
+        out_dir: Path, tag: str, atom_names: Sequence[str], atom_symbols: Sequence[str], delta_ppm: np.ndarray
+) -> Path:
     out_path = out_dir / f"{tag}_fastavg_shifts.tsv"
     with out_path.open("w") as fh:
         fh.write("# atom_idx\tatom_name\telement\tshift_ppm\n")
@@ -410,9 +475,7 @@ def _write_params(out_dir: Path, tag: str, params: Dict[str, str | float | int |
     return out_path
 
 
-# -----------------------------
-# Core per-tag processing
-# -----------------------------
+# ── Core per-tag processing ──────────────────────────────────────────────────
 def _process_tag(
         tag: str,
         *,
@@ -424,7 +487,7 @@ def _process_tag(
         temp_K: float,
 ) -> None:
     global BASIS_DEFAULT
-    BASIS_DEFAULT = basis  # allow per-run basis override
+    BASIS_DEFAULT = basis
 
     print(f"[tag] {tag}")
 
@@ -443,30 +506,30 @@ def _process_tag(
     atom_symbols_ref: Optional[List[str]] = None
 
     for row in rows:
-        atom_names, symbols, coords_A = _read_pdb_atoms(row.medoid_pdb)
+        atom_names, symbols, coords_A = _read_pdb_atoms(row.rep_pdb)
         if do_geom_opt:
-            coords_A = _optimize_geometry_pcm(symbols, coords_A, charge=charge, spin=spin, xc=xc,
-                                              solvent_eps=solvent_eps)
+            coords_A = _optimize_geometry_pcm(
+                symbols, coords_A, charge=charge, spin=spin, xc=xc, solvent_eps=solvent_eps
+            )
 
         sigma_iso = _compute_sigma_iso(symbols, coords_A, charge=charge, spin=spin, xc=xc)
         delta_ppm = _sigma_to_delta_ppm(symbols, sigma_iso, ref_sigma)
 
-        # Write per-cluster table
         _ = _write_cluster_shifts(OUT_DIR, tag, row.cid, atom_names, symbols, sigma_iso, delta_ppm)
 
         per_cluster_delta.append(delta_ppm)
         per_cluster_frac.append(float(row.fraction))
 
         if use_boltz:
-            e_pcm = _single_point_energy_pcm(symbols, coords_A, charge=charge, spin=spin, xc=xc,
-                                             solvent_eps=solvent_eps)
+            e_pcm = _single_point_energy_pcm(
+                symbols, coords_A, charge=charge, spin=spin, xc=xc, solvent_eps=solvent_eps
+            )
             per_cluster_energy.append(e_pcm)
 
         if atom_names_ref is None:
             atom_names_ref = list(atom_names)
             atom_symbols_ref = list(symbols)
 
-    # Choose weights
     if use_boltz:
         weights = _boltzmann_weights_from_energies(per_cluster_energy, temp_K=temp_K)
     else:
@@ -474,12 +537,9 @@ def _process_tag(
         denom = float(np.sum(fracs))
         weights = (fracs / denom) if denom > 1e-15 else (np.ones_like(fracs) / fracs.size)
 
-    # Fast-exchange weighted average
-    all_delta = np.stack(per_cluster_delta, axis=0)  # (k, A)
-    w = weights[:, None]
-    fastavg = np.sum(all_delta * w, axis=0)
+    all_delta = np.stack(per_cluster_delta, axis=0)
+    fastavg = np.sum(all_delta * weights[:, None], axis=0)
 
-    # Write outputs
     _ = _write_fastavg_shifts(OUT_DIR, tag, atom_names_ref, atom_symbols_ref, fastavg)
     _ = _write_params(
         OUT_DIR,
@@ -500,21 +560,17 @@ def _process_tag(
     print(f"[ok] {tag}: {len(rows)} clusters → fastavg written.")
 
 
-# -----------------------------
-# CLI
-# -----------------------------
+# ── CLI ──────────────────────────────────────────────────────────────────────
 def _parse_cli() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Compute NMR shifts (fast-exchange average) from clustered conformers.")
-    p.add_argument("--temp", type=float, default=TEMPERATURE_K_DEFAULT,
-                   help="Temperature in Kelvin for Boltzmann weights (default 298.15).")
-    p.add_argument("--eps", type=float, default=PCM_EPS_DEFAULT, help="PCM dielectric constant (default 46.7 ~ DMSO).")
-    p.add_argument("--no-pcm", action="store_true", help="Disable PCM entirely (no geometry PCM, no energy PCM).")
-    p.add_argument("--no-opt", action="store_true", help="Skip geometry optimization (use medoid geometry).")
-    p.add_argument("--no-boltz", action="store_true", help="Use MD cluster fractions instead of Boltzmann weights.")
+    p = argparse.ArgumentParser(description="Compute NMR shifts (fast-exchange avg) from clustered conformers.")
+    p.add_argument("--temp", type=float, default=TEMPERATURE_K_DEFAULT, help="Temperature [K] for Boltzmann weights.")
+    p.add_argument("--eps", type=float, default=PCM_EPS_DEFAULT, help="PCM dielectric (e.g., 46.7 for DMSO).")
+    p.add_argument("--no-pcm", action="store_true", help="Disable PCM (for geom energy and single-point E).")
+    p.add_argument("--no-opt", action="store_true", help="Skip geometry optimization of reps.")
+    p.add_argument("--no-boltz", action="store_true", help="Use MD fractions instead of Boltzmann weights.")
     p.add_argument("--xc", type=str, default=DFT_XC_DEFAULT, help="DFT functional (default b3lyp).")
     p.add_argument("--basis", type=str, default=BASIS_DEFAULT, help="Gaussian basis (default def2-tzvp).")
-    p.add_argument("--tags", type=str, nargs="*",
-                   help="Explicit tags to process (defaults to all *_clusters.tsv in e_cluster/).")
+    p.add_argument("--tags", type=str, nargs="*", help="Explicit tags (default: all *_clusters.tsv).")
     return p.parse_args()
 
 
