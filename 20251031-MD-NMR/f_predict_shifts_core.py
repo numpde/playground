@@ -146,72 +146,167 @@ def guess_rep_path(tag: str, cid: int) -> Path:
 
 def load_clusters_table(path: Path, tag: str) -> List[ClusterRow]:
     """
-    Expected columns (loose):
-      - cluster id (cid or cluster or cluster_id or similar)
-      - optional fraction / population / weight
-      - optional rep pdb path
+    Load cluster summary for `tag`.
 
-    We make best-effort guesses for column names.
+    Supports two layouts:
+
+    (A) A TSV with real headers, e.g. columns like:
+        cid / cluster_id / cluster / id
+        fraction / pop / weight / ...
+        rep_pdb / rep_path / ...
+        In that case we use pandas normally.
+
+    (B) The no-header, comment-prefixed format written by e_cluster.py:
+        #cluster_id  count  fraction  medoid_frame_idx  rep_pdb_path
+        0            123    0.2049    157               stryx_cluster_0_rep.pdb
+        1            115    0.1918    842               stryx_cluster_1_rep.pdb
+        ...
+        (tab-separated)
+
+        We parse that manually.
     """
-    df = pd.read_csv(path, sep=None, engine="python", comment="#").copy()
 
-    cols = {c.lower(): c for c in df.columns}
-    cid = None
-    frac = None
-    rep = None
+    # --- attempt A: try the "pandas with headers" path we had before ---
+    try:
+        df_try = pd.read_csv(path, sep=None, engine="python", comment="#").copy()
+        cols = {c.lower(): c for c in df_try.columns}
 
-    for cand in ("cid", "cluster", "cluster_id", "id"):
-        if cand in cols:
-            cid = cols[cand]
-            break
-    for cand in ("fraction", "pop", "population", "weight", "boltz", "md_fraction"):
-        if cand in cols:
-            frac = cols[cand]
-            break
-    for cand in ("rep", "rep_pdb", "pdb", "representative"):
-        if cand in cols:
-            rep = cols[cand]
-            break
+        cid_col = None
+        for cand in (
+            "cid",
+            "cluster",
+            "cluster_id",
+            "clusteridx",
+            "cluster_idx",
+            "id",
+        ):
+            if cand in cols:
+                cid_col = cols[cand]
+                break
 
-    if cid is None:
-        raise ValueError(f"[{path}] no cluster id column found.")
+        if cid_col is not None:
+            # good, we think this is a proper headered table
+            frac_col = None
+            for cand in (
+                "fraction",
+                "pop",
+                "population",
+                "weight",
+                "boltz",
+                "md_fraction",
+                "mdfrac",
+                "md_weight",
+            ):
+                if cand in cols:
+                    frac_col = cols[cand]
+                    break
 
-    # normalize names
-    if cid == "cid" and (frac is None and rep is None):
-        # probably already [cid,fraction,rep_path]
-        if df.shape[1] < 2:
-            raise ValueError(f"[{path.name}] Need at least two columns (cid, fraction).")
-        df.columns = ["cid", "fraction"] + [f"x{i}" for i in range(df.shape[1] - 2)]
-        cid, frac, rep = "cid", "fraction", None
-    else:
-        ren = {cid: "cid"}
-        if frac: ren[frac] = "fraction"
-        if rep:  ren[rep] = "rep_path"
-        df = df.rename(columns=ren)
+            rep_col = None
+            for cand in (
+                "rep",
+                "rep_pdb",
+                "rep_path",
+                "pdb",
+                "pdb_path",
+                "representative",
+            ):
+                if cand in cols:
+                    rep_col = cols[cand]
+                    break
 
-    cidv = pd.to_numeric(df["cid"], errors="raise")
-    frv = pd.to_numeric(df["fraction"], errors="coerce") if "fraction" in df.columns else None
-    rpv = df["rep_path"] if "rep_path" in df.columns else None
+            cidv = pd.to_numeric(df_try[cid_col], errors="raise")
+            if frac_col is not None:
+                frv = pd.to_numeric(df_try[frac_col], errors="coerce")
+            else:
+                frv = None
+            if rep_col is not None:
+                rpv = df_try[rep_col].astype(str)
+            else:
+                rpv = None
 
+            rows: List[ClusterRow] = []
+            for i in range(len(df_try)):
+                cid_i = int(cidv.iloc[i])
+                # fraction
+                if frv is not None and pd.notna(frv.iloc[i]):
+                    frac_i = float(frv.iloc[i])
+                else:
+                    frac_i = float("nan")
+                # representative pdb
+                if rpv is not None and rpv.iloc[i].strip():
+                    rp_raw = Path(rpv.iloc[i].strip())
+                    rep_path = (
+                        rp_raw
+                        if rp_raw.is_absolute()
+                        else (path.parent / rp_raw)
+                    )
+                else:
+                    rep_path = guess_rep_path(tag, cid_i)
+
+                rows.append(
+                    ClusterRow(
+                        cid=cid_i,
+                        fraction=frac_i,
+                        rep_pdb=rep_path.resolve(),
+                    )
+                )
+
+            # fill missing fractions uniformly if needed
+            fracs = np.array([r.fraction for r in rows], dtype=float)
+            if not np.all(np.isfinite(fracs)):
+                n = len(rows)
+                for r in rows:
+                    r.fraction = 1.0 / n
+
+            return rows
+
+    except Exception:
+        # If pandas read fails completely, we fall through to manual.
+        pass
+
+    # --- attempt B: manual parser for e_cluster.py output ---
     rows: List[ClusterRow] = []
-    for i in range(len(df)):
-        cid_i = int(cidv.iloc[i])
-        if frv is not None and pd.notna(frv.iloc[i]):
-            frac_i = float(frv.iloc[i])
-        else:
-            frac_i = float("nan")
-        if rpv is not None and isinstance(rpv.iloc[i], str) and rpv.iloc[i].strip():
-            rp = Path(rpv.iloc[i])
-            rep_path = rp if rp.is_absolute() else (path.parent / rp)
-        else:
-            rep_path = guess_rep_path(tag, cid_i)
-        rows.append(ClusterRow(cid=cid_i, fraction=frac_i, rep_pdb=rep_path.resolve()))
+    with path.open("r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # columns: cluster_id  count  fraction  medoid_frame_idx  rep_pdb_path
+            parts = line.split()
+            # We expect at least 5 columns because rep_pdb_path has no spaces.
+            if len(parts) < 5:
+                raise ValueError(
+                    f"[{path}] can't parse line (need 5+ cols): {line!r}"
+                )
 
+            # cluster_id
+            cid_i = int(parts[0])
+
+            # parts[1] is raw count (we don't actually need it downstream)
+            # fraction
+            frac_i = float(parts[2])
+
+            # parts[3] is medoid_frame_idx (not needed here, but good sanity)
+            # rep_pdb_path
+            rep_rel = parts[4]
+            rep_path = (path.parent / rep_rel).resolve()
+
+            rows.append(
+                ClusterRow(
+                    cid=cid_i,
+                    fraction=frac_i,
+                    rep_pdb=rep_path,
+                )
+            )
+
+    # if for some reason fractions are missing / nan (shouldn't happen here),
+    # normalize uniformly:
     fracs = np.array([r.fraction for r in rows], dtype=float)
     if not np.all(np.isfinite(fracs)):
         n = len(rows)
         for r in rows:
             r.fraction = 1.0 / n
+
     return rows
 
 
