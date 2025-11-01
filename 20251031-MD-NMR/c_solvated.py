@@ -113,7 +113,7 @@ OUT_DIR = mkdir(Path(__file__).with_suffix(''))  # ./c_solvated/
 SOLVENT_CHOICE = "cdcl3"  # "dmso", "water", "cdcl3"
 BOX_EDGE_NM = 3.0  # cubic periodic box edge length (nm)
 
-TARGET_TEMP = 300 * unit.kelvin
+TARGET_TEMP = (25 + 273.15) * unit.kelvin
 TARGET_PRESSURE = 1 * unit.bar
 
 TIMESTEP_PS = 0.001  # 1 fs = 0.001 ps
