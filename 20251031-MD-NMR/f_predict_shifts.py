@@ -113,11 +113,11 @@ from pyscf import gto, dft, solvent
 # pyscf-properties extension (must be installed via pip from pyscf/properties)
 from pyscf.prop import nmr as pyscf_nmr
 
-# Kill "Module ... is under testing" spam from pyscf.prop.* modules
+# Silence all PySCF prop “under testing / not fully tested” warnings
 warnings.filterwarnings(
-    action="ignore",
+    "ignore",
     category=UserWarning,
-    module=r"pyscf\.prop\..*",
+    module=r"pyscf\.prop(\.|$)"
 )
 
 # optional geometry optimization via geomeTRIC
