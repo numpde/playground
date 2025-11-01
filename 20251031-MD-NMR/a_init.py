@@ -8,6 +8,10 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.rdmolfiles import PDBWriter
 
+try:
+    import gpu4pyscf
+except ImportError:
+    print("Warning: module gpu4pyscf not found")
 
 # ---------------------------------------------------------------------
 # config / output
@@ -19,7 +23,7 @@ OUT_DIR = mkdir(Path(__file__).with_suffix(''))
 # - neutral (COOH)
 # - deprotonated (COO-)  ← dominant around pH ~7 in water
 ASPIRIN_NEUTRAL = "CC(=O)OC1=CC=CC=C1C(=O)O"
-ASPIRIN_DEPROT  = None  # "CC(=O)OC1=CC=CC=C1C(=O)[O-]"
+ASPIRIN_DEPROT = None  # "CC(=O)OC1=CC=CC=C1C(=O)[O-]"
 
 # Strychnine:
 # You currently use this neutral SMILES (free base). :contentReference[oaicite:1]{index=1}
@@ -102,7 +106,7 @@ def build_targets() -> List[Dict]:
     # Aspirin
     targets.append(
         _state_dict(
-            name='aspirin_neutral',            # nonpolar solvent, low pH
+            name='aspirin_neutral',  # nonpolar solvent, low pH
             smiles=ASPIRIN_NEUTRAL,
             charge_hint=0,
             pdb_name='aspirin_neutral_init.pdb',
@@ -122,7 +126,7 @@ def build_targets() -> List[Dict]:
     # Strychnine
     targets.append(
         _state_dict(
-            name='strychnine_neutral',         # free base, organic solvent
+            name='strychnine_neutral',  # free base, organic solvent
             smiles=STRYCHNINE_NEUTRAL,
             charge_hint=0,
             pdb_name='strychnine_neutral_init.pdb',
