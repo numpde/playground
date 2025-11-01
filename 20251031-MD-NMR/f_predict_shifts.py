@@ -1,5 +1,5 @@
 # /home/ra/repos/playground/20251031-MD-NMR/f_predict_shifts.py
-# Timestamp: 2025-11-01 17:45 Africa/Nairobi
+# Timestamp: 2025-11-01 18:20 Africa/Nairobi
 #
 # Step f: predict NMR shifts (1H/13C) from clustered conformers.
 # Outputs per tag:
@@ -14,12 +14,15 @@
 # - TMS reference at same electronic level.
 # - Optional pandas TSV loader; falls back to csv.
 # - Suppresses PySCF “under testing / not fully tested” warnings.
+# - Logging with GPU detection (CuPy / gpu4pyscf / PyTorch).
 
 from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -27,6 +30,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+LOG = logging.getLogger("nmrshifts")
 
 # Optional pandas
 try:
@@ -42,14 +47,22 @@ warnings.filterwarnings("ignore", message=r"Module .* is not fully tested", cate
 
 # PySCF
 from pyscf import gto, dft
+import pyscf
 
-# Optional geometry optimization
+# Optional geometry optimization backends
 try:
     from pyscf.geomopt.geomeTRIC import optimize as geom_optimize
 
     GEOMOPT_AVAILABLE = True
 except Exception:
     GEOMOPT_AVAILABLE = False
+
+try:
+    from pyscf.geomopt.berny import optimize as berny_optimize
+
+    BERNY_AVAILABLE = True
+except Exception:
+    BERNY_AVAILABLE = False
 
 # ── Tunables (CLI-overridable) ────────────────────────────────────────────────
 DFT_XC_DEFAULT = "b3lyp"
@@ -63,8 +76,85 @@ CLUSTERS_DIR = Path("e_cluster")
 
 PCM_EPS_DEFAULT = 46.7  # DMSO ~298 K
 TEMPERATURE_K_DEFAULT = 298.15
-DO_GEOM_OPT_DEFAULT = True
-USE_BOLTZMANN_WEIGHTS_DEFAULT = True
+
+
+# ── Logging setup & GPU detection ────────────────────────────────────────────
+def _setup_logging(level: str, quiet: bool) -> None:
+    numeric = getattr(logging, level.upper(), logging.INFO)
+    if quiet:
+        numeric = max(numeric, logging.WARNING)
+    logging.basicConfig(
+        level=numeric,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # Reduce noisy libs
+    logging.getLogger("pyscf").setLevel(logging.WARNING)
+    logging.getLogger("numexpr").setLevel(logging.WARNING)
+
+
+def _detect_gpu() -> Dict[str, object]:
+    """Detect GPU backends and devices (CuPy / gpu4pyscf / PyTorch)."""
+    info: Dict[str, object] = {
+        "gpu_available": False,
+        "backend": [],
+        "device_count": 0,
+        "devices": [],
+        "env": {},
+    }
+    # Capture relevant env toggles for transparency
+    for k in ("CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        if k in os.environ:
+            info["env"][k] = os.environ[k]
+
+    # CuPy
+    try:
+        import cupy as cp  # type: ignore
+        try:
+            n = int(cp.cuda.runtime.getDeviceCount())
+        except Exception:
+            n = 0
+        if n > 0:
+            info["gpu_available"] = True
+            info["backend"].append("cupy")
+            info["device_count"] = max(info["device_count"], n)
+            for i in range(n):
+                try:
+                    props = cp.cuda.runtime.getDeviceProperties(i)
+                    name = props["name"]
+                    if isinstance(name, bytes):
+                        name = name.decode()
+                    info["devices"].append(str(name))
+                except Exception:
+                    info["devices"].append(f"device_{i}")
+    except Exception:
+        pass
+
+    # gpu4pyscf presence
+    try:
+        import gpu4pyscf  # type: ignore
+        info["gpu_available"] = True
+        info["backend"].append("gpu4pyscf")
+    except Exception:
+        pass
+
+    # PyTorch (not used by PySCF, but helpful for cluster introspection)
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            info["gpu_available"] = True
+            if "torch" not in info["backend"]:
+                info["backend"].append("torch")
+            n = torch.cuda.device_count()
+            info["device_count"] = max(info["device_count"], n)
+            for i in range(n):
+                info["devices"].append(torch.cuda.get_device_name(i))
+    except Exception:
+        pass
+
+    # Deduplicate device names
+    info["devices"] = list(dict.fromkeys(info["devices"]))
+    return info
 
 
 # ── Utils ────────────────────────────────────────────────────────────────────
@@ -105,25 +195,54 @@ def _attach_pcm_and_build_scf(mol: gto.Mole, xc: str, solvent_eps: Optional[floa
             from pyscf import solvent as pyscf_solvent
             mf = pyscf_solvent.ddCOSMO(mf)
             mf.with_solvent.eps = float(solvent_eps)
+            LOG.debug("Attached ddCOSMO PCM (eps=%.3f).", solvent_eps)
         except Exception as e:
-            print(f"[warn] PCM requested but failed to attach: {e}; proceeding gas-phase.")
+            LOG.warning("PCM requested but failed to attach: %s; proceeding gas-phase.", e)
     return mf
 
 
 def _optimize_geometry_pcm(
-        symbols: Sequence[str], coords_A: np.ndarray, charge: int, spin: int, xc: str, solvent_eps: Optional[float]
+        symbols: Sequence[str],
+        coords_A: np.ndarray,
+        charge: int,
+        spin: int,
+        xc: str,
+        solvent_eps: Optional[float],
+        backend: str = "auto",
+        quiet: bool = False,
 ) -> np.ndarray:
-    if not GEOMOPT_AVAILABLE:
-        print("[info] geomeTRIC not available; skipping geometry optimization.")
+    # choose backend
+    if backend == "geom":
+        use_geom = GEOMOPT_AVAILABLE
+        use_berny = False
+    elif backend == "berny":
+        use_geom = False
+        use_berny = BERNY_AVAILABLE
+    elif backend == "none":
+        use_geom = use_berny = False
+    else:  # auto
+        use_geom = GEOMOPT_AVAILABLE
+        use_berny = (not use_geom) and BERNY_AVAILABLE
+
+    if not (use_geom or use_berny):
+        if not quiet:
+            LOG.info("Geometry optimization skipped (no geomeTRIC/Berny or '--opt none').")
         return coords_A
+
     mol = _make_mol(symbols, coords_A, charge=charge, spin=spin)
     mf_pcm = _attach_pcm_and_build_scf(mol, xc=xc, solvent_eps=solvent_eps, use_pcm=True)
+
     try:
-        _e_opt, mol_opt = geom_optimize(mf_pcm, tol=GRAD_CONV_TOL, maxsteps=200, callback=None)
+        if use_geom:
+            LOG.info("Geometry optimization via geomeTRIC.")
+            _e_opt, mol_opt = geom_optimize(mf_pcm, tol=GRAD_CONV_TOL, maxsteps=200, callback=None)
+        else:
+            LOG.info("Geometry optimization via Berny.")
+            mol_opt = berny_optimize(mf_pcm, maxsteps=200)
         coords_bohr = mol_opt.atom_coords(unit="Bohr")
         return coords_bohr * 0.529177210903
     except Exception as e:
-        print(f"[warn] geometry optimization failed: {e}; using input geometry.")
+        LOG.warning("Geometry optimization failed: %s; using input geometry.", e)
         return coords_A
 
 
@@ -135,7 +254,6 @@ def _nmr_tensors_from_mf(mf) -> np.ndarray:
       - from pyscf.prop.nmr import NMR
       - from pyscf.prop.nmr import rhf/uhf/rks/uks → NMR
       - method on mf: mf.NMR()
-    Raises a clear error with hints if none are available.
     """
     # 1) Unified NMR class
     try:
@@ -144,7 +262,7 @@ def _nmr_tensors_from_mf(mf) -> np.ndarray:
     except Exception:
         pass
 
-    # 2) Method on mf (some builds expose this)
+    # 2) Method on mf
     try:
         if hasattr(mf, "NMR"):
             return mf.NMR().kernel()
@@ -154,14 +272,10 @@ def _nmr_tensors_from_mf(mf) -> np.ndarray:
     # 3) Flavor-specific modules
     try:
         from pyscf.prop import nmr as nmrmod  # type: ignore
-        # DFT vs HF decided by mf class; spin via mf.mol.spin
-        if isinstance(mf, dft.rks.RKS):
-            if hasattr(nmrmod, "rks"):
-                return nmrmod.rks.NMR(mf).kernel()
-        if isinstance(mf, dft.uks.UKS):
-            if hasattr(nmrmod, "uks"):
-                return nmrmod.uks.NMR(mf).kernel()
-        # Fallbacks if DFT-specific not present — try RHF/UHF wrappers
+        if isinstance(mf, dft.rks.RKS) and hasattr(nmrmod, "rks"):
+            return nmrmod.rks.NMR(mf).kernel()
+        if isinstance(mf, dft.uks.UKS) and hasattr(nmrmod, "uks"):
+            return nmrmod.uks.NMR(mf).kernel()
         if hasattr(nmrmod, "rhf") and mf.mol.spin == 0:
             return nmrmod.rhf.NMR(mf).kernel()
         if hasattr(nmrmod, "uhf") and mf.mol.spin != 0:
@@ -174,10 +288,6 @@ def _nmr_tensors_from_mf(mf) -> np.ndarray:
         "Tried: pyscf.prop.nmr.NMR, nmr.rks/uks/rhf/uhf.NMR, and mf.NMR(). "
         "Please ensure PySCF's property modules are installed/enabled."
     )
-
-
-def _sigma_iso_from_tensors(tensors: np.ndarray) -> np.ndarray:
-    return (np.trace(tensors, axis1=1, axis2=2) / 3.0).astype(float)
 
 
 def _compute_sigma_iso(symbols, coords_A, charge, spin, xc):
@@ -220,7 +330,7 @@ def _tms_geometry() -> Tuple[List[str], np.ndarray]:
     coords: List[Tuple[float, float, float]] = []
 
     def add(a: str, x: float, y: float, z: float) -> None:
-        symbols.append(a);
+        symbols.append(a)
         coords.append((x, y, z))
 
     add("Si", 0.0, 0.0, 0.0)
@@ -236,8 +346,11 @@ def _tms_geometry() -> Tuple[List[str], np.ndarray]:
             px, py, pz = 1.0, 0.0, 0.0
         else:
             px, py, pz = 0.0, 1.0, 0.0
-        vx, vy, vz = px - (ax * px + ay * py + az * pz) * ax, py - (ax * px + ay * py + az * pz) * ay, pz - (
-                    ax * px + ay * py + az * pz) * az
+        vx, vy, vz = (
+            px - (ax * px + ay * py + az * pz) * ax,
+            py - (ax * px + ay * py + az * pz) * ay,
+            pz - (ax * px + ay * py + az * pz) * az,
+        )
         vn = (vx * vx + vy * vy + vz * vz) ** 0.5
         vx, vy, vz = vx / vn, vy / vn, vz / vn
         wx, wy, wz = ay * vz - az * vy, az * vx - ax * vz, ax * vy - ay * vx
@@ -257,7 +370,9 @@ def _tms_ref_sigma(xc: str) -> Dict[str, float]:
     mf = _build_rks_or_uks(mol, xc=xc)
     _ = mf.kernel()
     tensors = _nmr_tensors_from_mf(mf)
-    sigma = _sigma_iso_from_tensors(tensors)
+    sigma = (np.trace(tensors, axis1=1, axis2=2) / 3.0).astype(float) if isinstance(tensors,
+                                                                                    np.ndarray) and tensors.ndim == 3 else np.asarray(
+        tensors, dtype=float)
     return {
         "H": float(np.mean(sigma[[i for i, s in enumerate(symbols) if s.upper() == "H"]])),
         "C": float(np.mean(sigma[[i for i, s in enumerate(symbols) if s.upper() == "C"]])),
@@ -270,7 +385,9 @@ def _single_point_energy_pcm(
 ) -> float:
     mol = _make_mol(symbols, coords_A, charge=charge, spin=spin)
     mf = _attach_pcm_and_build_scf(mol, xc=xc, solvent_eps=solvent_eps, use_pcm=True)
-    return float(mf.kernel())
+    e = float(mf.kernel())
+    LOG.debug("PCM single-point energy (Ha): %.10f", e)
+    return e
 
 
 def _boltzmann_weights_from_energies(E_hartree: Sequence[float], temp_K: float) -> np.ndarray:
@@ -355,8 +472,10 @@ def _load_clusters_table(path: Path, tag: str) -> List[ClusterRow]:
         else:
             ren = {}
             ren[cid_name] = "cid"
-            if frac_name: ren[frac_name] = "fraction"
-            if rep_name:  ren[rep_name] = "rep_path"
+            if frac_name:
+                ren[frac_name] = "fraction"
+            if rep_name:
+                ren[rep_name] = "rep_path"
             if ren:
                 df = df.rename(columns=ren)
 
@@ -422,11 +541,11 @@ def _read_pdb_atoms(pdb_path: Path) -> Tuple[List[str], List[str], np.ndarray]:
             if line.startswith(("ATOM", "HETATM")):
                 name = line[12:16].strip()
                 el = line[76:78].strip() or name[0]
-                x = float(line[30:38]);
-                y = float(line[38:46]);
+                x = float(line[30:38])
+                y = float(line[38:46])
                 z = float(line[46:54])
-                atom_names.append(name);
-                symbols.append(el);
+                atom_names.append(name)
+                symbols.append(el)
                 coords.append((x, y, z))
     if not atom_names:
         raise RuntimeError(f"No atoms parsed from {pdb_path}")
@@ -485,11 +604,13 @@ def _process_tag(
         do_geom_opt: bool,
         use_boltz: bool,
         temp_K: float,
+        opt_backend: str,
+        quiet: bool,
 ) -> None:
     global BASIS_DEFAULT
     BASIS_DEFAULT = basis
 
-    print(f"[tag] {tag}")
+    LOG.info("[tag] %s", tag)
 
     cluster_tsv = CLUSTERS_DIR / f"{tag}_clusters.tsv"
     if not cluster_tsv.exists():
@@ -509,7 +630,8 @@ def _process_tag(
         atom_names, symbols, coords_A = _read_pdb_atoms(row.rep_pdb)
         if do_geom_opt:
             coords_A = _optimize_geometry_pcm(
-                symbols, coords_A, charge=charge, spin=spin, xc=xc, solvent_eps=solvent_eps
+                symbols, coords_A, charge=charge, spin=spin, xc=xc, solvent_eps=solvent_eps,
+                backend=opt_backend, quiet=quiet
             )
 
         sigma_iso = _compute_sigma_iso(symbols, coords_A, charge=charge, spin=spin, xc=xc)
@@ -550,14 +672,15 @@ def _process_tag(
             "charge": charge,
             "spin": spin,
             "pcm_eps": (solvent_eps if solvent_eps is not None else "None"),
-            "geom_optimized_pcm": do_geom_opt,
+            "geom_optimized": do_geom_opt,
+            "opt_backend": opt_backend,
             "weights": ("Boltzmann" if use_boltz else "MD fractions"),
             "temperature_K": temp_K,
             "k_B[Hartree/K]": 3.166811563e-6,
-            "notes": "Shieldings from gas-phase SCF at fixed geometry; TMS ref at same level.",
+            "pyscf_version": getattr(pyscf, "__version__", "unknown"),
         },
     )
-    print(f"[ok] {tag}: {len(rows)} clusters → fastavg written.")
+    LOG.info("[ok] %s: %d clusters → fastavg written.", tag, len(rows))
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -567,27 +690,49 @@ def _parse_cli() -> argparse.Namespace:
     p.add_argument("--eps", type=float, default=PCM_EPS_DEFAULT, help="PCM dielectric (e.g., 46.7 for DMSO).")
     p.add_argument("--no-pcm", action="store_true", help="Disable PCM (for geom energy and single-point E).")
     p.add_argument("--no-opt", action="store_true", help="Skip geometry optimization of reps.")
+    p.add_argument("--opt", choices=["auto", "geom", "berny", "none"], default="auto",
+                   help="Geometry optimization backend.")
     p.add_argument("--no-boltz", action="store_true", help="Use MD fractions instead of Boltzmann weights.")
     p.add_argument("--xc", type=str, default=DFT_XC_DEFAULT, help="DFT functional (default b3lyp).")
     p.add_argument("--basis", type=str, default=BASIS_DEFAULT, help="Gaussian basis (default def2-tzvp).")
     p.add_argument("--tags", type=str, nargs="*", help="Explicit tags (default: all *_clusters.tsv).")
+    p.add_argument("--log-level", type=str, default="INFO",
+                   help="Logging level: DEBUG, INFO, WARNING, ERROR.")
+    p.add_argument("--quiet", action="store_true", help="Reduce informational messages.")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_cli()
+    _setup_logging(args["log_level"] if isinstance(args, dict) else args.log_level, args.quiet)
+
     _mkdir_p(OUT_DIR)
 
     solvent_eps = None if args.no_pcm else float(args.eps)
     do_geom_opt = (not args.no_opt)
     use_boltz = (not args.no_boltz)
 
+    # Environment banner & GPU
+    gpu = _detect_gpu()
+    LOG.info("PySCF %s | DFT=%s | basis=%s | PCM=%s | opt=%s | temp=%.2f K",
+             getattr(pyscf, "__version__", "unknown"),
+             args.xc, args.basis,
+             ("off" if solvent_eps is None else f"ddCOSMO eps={solvent_eps:.2f}"),
+             ("none" if not do_geom_opt else args.opt),
+             float(args.temp))
+    if gpu["gpu_available"]:
+        LOG.info("GPU detected: backends=%s | devices=%s", ",".join(gpu["backend"]), gpu["devices"])
+    else:
+        LOG.info("GPU not detected; running on CPU.")
+    if gpu["env"]:
+        LOG.debug("Env: %s", gpu["env"])
+
     if args.tags:
         tags = args.tags
     else:
         cluster_files = sorted(CLUSTERS_DIR.glob("*_clusters.tsv"))
         if not cluster_files:
-            print("[error] no *_clusters.tsv in e_cluster/")
+            LOG.error("No *_clusters.tsv in %s/", CLUSTERS_DIR)
             return
         tags = [cf.stem.removesuffix("_clusters") for cf in cluster_files]
 
@@ -600,8 +745,10 @@ def main() -> None:
             do_geom_opt=do_geom_opt,
             use_boltz=use_boltz,
             temp_K=float(args.temp),
+            opt_backend=args.opt,
+            quiet=args.quiet,
         )
-    print("[done]")
+    LOG.info("[done]")
 
 
 if __name__ == "__main__":
