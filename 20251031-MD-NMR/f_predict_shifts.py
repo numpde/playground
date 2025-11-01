@@ -113,34 +113,37 @@ This wrapper only dispatches to the sub-scripts. See
 
 from __future__ import annotations
 
-import argparse
-import sys
-
 
 def main():
-    p = argparse.ArgumentParser(prog="f_predict_shifts.py",
-                                description="NMR shifts pipeline (compute heavy step, then average reweighting).")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    import argparse, sys
 
+    PROG = "f_predict_shifts.py"
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="NMR shifts pipeline (compute heavy step, then average reweighting).",
+        add_help=True,
+    )
+    sub = p.add_subparsers(dest="cmd")
     sub.add_parser("compute", help="Compute per-cluster shifts and PCM energies.")
     sub.add_parser("average", help="Average precomputed shifts with Boltzmann/MD fractions.")
 
-    # passthrough args (we don't duplicate—all flags live in the sub-scripts)
-    # Usage examples printed below.
-
     if len(sys.argv) == 1:
         p.print_help(sys.stderr)
-        print("""
+        print(r"""
 Examples:
 
   # 1) Heavy step: per-cluster NMR & PCM energies (GPU on if available)
+  ./f_predict_shifts.py compute --tags aspirin_neutral_cdcl3 --xc b3lyp --basis def2-tzvp --solvent DMSO --gpu auto
+
+  # 1a) Same as above (allows a separator after the subcommand too)
   ./f_predict_shifts.py compute -- --tags aspirin_neutral_cdcl3 --xc b3lyp --basis def2-tzvp --solvent DMSO --gpu auto
 
   # 2) Fast step: average at chosen temperature and solvent
-  ./f_predict_shifts.py average -- --tags aspirin_neutral_cdcl3 --solvent DMSO --temp 298.15
+  ./f_predict_shifts.py average --tags aspirin_neutral_cdcl3 --solvent DMSO --temp 298.15
 
 Notes:
-  - Pass flags after the subcommand using `--` to forward them to the underlying script.
+  - Flags after the subcommand are forwarded to the specific script.
+  - A lone '--' separator is optional; both styles work.
   - Outputs live under f_predict_shifts/<tag>/ :
       cluster_<cid>_shifts.tsv
       energies_<solvent>.tsv
@@ -148,19 +151,35 @@ Notes:
 """)
         return
 
-    # Dispatch by exec’ing the sibling scripts so they own their argparsers cleanly
-    if sys.argv[1] == "compute":
-        # Everything after the first "compute" goes to compute script
-        argv = sys.argv[2:]  # may begin with "--"
+    # Accept a stray top-level '--' (e.g., "script.py -- compute ...")
+    argv_all = sys.argv[1:]
+    if argv_all and argv_all[0] == "--":
+        argv_all = argv_all[1:]
+
+    if not argv_all:
+        p.print_help(sys.stderr)
+        return
+
+    cmd = argv_all[0]
+    rest = argv_all[1:]
+
+    # Also accept a separator immediately after the subcommand
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+
+    if cmd == "compute":
         from f_predict_shifts_compute import main as run_compute
-        sys.argv = ["f_predict_shifts_compute.py"] + argv
+        sys.argv = ["f_predict_shifts_compute.py"] + rest
         return run_compute()
 
-    if sys.argv[1] == "average":
-        argv = sys.argv[2:]
+    if cmd == "average":
         from f_predict_shifts_average import main as run_average
-        sys.argv = ["f_predict_shifts_average.py"] + argv
+        sys.argv = ["f_predict_shifts_average.py"] + rest
         return run_average()
+
+    # Unknown subcommand → show help and a hint
+    p.print_help(sys.stderr)
+    print(f"\n[error] Unknown subcommand: {cmd!r}. Use 'compute' or 'average'.")
 
 
 if __name__ == "__main__":
