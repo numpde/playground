@@ -247,39 +247,64 @@ def _make_mol(
 
 
 def _attach_pcm_and_build_scf(
-        mol: "gto.Mole",
+        mol,
         xc: str,
         solvent_eps: float | None,
         use_pcm: bool,
-) -> "dft.KS":
+):
     """
-    Create an SCF object (RKS for spin=0, UKS otherwise),
-    optionally wrap with PCM solvent,
-    and apply SCF tolerances.
+    Build a DFT mean-field object (RKS or UKS), optionally wrap it in a PCM
+    solvent model, set SCF tolerances, and *try* to move it to the GPU.
 
-    use_pcm=True:
-        attach solvent.PCM(mf), set dielectric constant, etc.
-    use_pcm=False:
-        plain gas-phase SCF.
+    Returns
+    -------
+    mf : PySCF / GPU4PySCF mean-field object
+         - If GPU4PySCF is installed and a supported NVIDIA GPU is visible,
+           this will be a GPU-backed object (arrays live on the GPU, SCF and
+           gradients run on CUDA kernels).
+         - Otherwise it falls back to normal CPU PySCF behavior.
 
-    Returns:
-        mf : the SCF object (RKS or UKS or PCM-wrapped version)
+    Why do we do GPU here?
+    ----------------------
+    - SCF, gradients, Hessians, PCM response, and geometry optimization are
+      all GPU-accelerated in GPU4PySCF, including hybrid DFT functionals,
+      with reported ~30× speedups vs a 32-core CPU node. :contentReference[oaicite:2]{index=2}
+    - PySCF/GPU4PySCF exposes mf.to_gpu() / mf.to_cpu() to convert objects
+      (and all their ndarray attributes) between CPU NumPy and GPU CuPy
+      representations. :contentReference[oaicite:3]{index=3}
+    - By doing the conversion here, every later call (mf.kernel(), geom_opt,
+      mf.nuc_grad_method(), etc.) can benefit without any more code changes.
     """
+
+    # 1. Build base mean-field: RKS if closed-shell, UKS if open-shell
     if mol.spin == 0:
         mf = dft.RKS(mol)
     else:
         mf = dft.UKS(mol)
 
     mf.xc = xc
-    mf.conv_tol = SCF_CONV_TOL
-    mf.max_cycle = SCF_MAX_CYC
+    mf.conv_tol = SCF_CONV_TOL  # your tight SCF tolerance
+    mf.max_cycle = SCF_MAX_CYC  # your SCF iteration cap
 
+    # 2. Optionally wrap with PCM (for solvated optimization / SCF-in-solvent)
     if use_pcm and solvent_eps is not None:
         mf = solvent.PCM(mf)
+        # PCM setup: PySCF/GPU4PySCF supports PCM and even PCM gradients on GPU. :contentReference[oaicite:4]{index=4}
         mf.with_solvent.method = PCM_METHOD
         mf.with_solvent.eps = solvent_eps
         mf.conv_tol = SCF_CONV_TOL
         mf.max_cycle = SCF_MAX_CYC
+
+    # 3. Try to move to GPU
+    #    .to_gpu() is provided by GPU4PySCF. If it's available and succeeds,
+    #    mf becomes a GPU-backed object. If not (no GPU / no plugin), we
+    #    just keep mf on CPU and continue normally.
+    try:
+        mf_gpu = mf.to_gpu()
+        print("[info] using GPU4PySCF for SCF/DFT (+PCM if enabled)")
+        mf = mf_gpu
+    except Exception:
+        print("[info] GPU4PySCF not available or GPU not supported; staying on CPU")
 
     return mf
 
