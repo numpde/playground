@@ -110,7 +110,7 @@ OUT_DIR = mkdir(Path(__file__).with_suffix(''))  # ./c_solvated/
 # MD / thermodynamic settings
 # ---------------------------------------------------------------------
 
-SOLVENT_CHOICE = "dmso"  # "dmso", "water", "cdcl3"
+SOLVENT_CHOICE = "cdcl3"  # "dmso", "water", "cdcl3"
 BOX_EDGE_NM = 3.0  # cubic periodic box edge length (nm)
 
 TARGET_TEMP = 300 * unit.kelvin
