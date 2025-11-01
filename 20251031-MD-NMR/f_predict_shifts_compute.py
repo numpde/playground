@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# f_predict_shifts_compute.py
+
 # Compute per-cluster NMR shifts and PCM energies (heavy step)
 # 2025-11-01
 

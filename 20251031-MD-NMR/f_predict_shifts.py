@@ -1,180 +1,245 @@
 #!/usr/bin/env python3
-# Main entrypoint: subcommands that call the two drivers
+# f_predict_shifts.py
+#
+# Main entrypoint / dispatcher for the NMR observable prediction pipeline.
+#
+# Subcommands:
+#   compute  -> heavy per-cluster quantum chemistry (shieldings → shifts,
+#               scalar J couplings, ddCOSMO energies)
+#   average  -> fast Boltzmann/MD averaging across clusters (shifts, J)
+#
 # 2025-11-01
 
 """
 f_predict_shifts.py
 ===================
 
-Main entrypoint for a two-stage NMR shift pipeline with subcommands:
+This script provides two pipeline stages:
 
-  1) compute — Heavy step:
-     • For each tag (system), read clustered representatives from e_cluster/<tag>_clusters.tsv
-     • Compute per-cluster *gas-phase* NMR shieldings → per-cluster shifts (TMS referenced)
-     • Compute PCM single-point energies (for a chosen solvent or epsilon) for Boltzmann weights
-     • Writes results under: f_predict_shifts/<tag>/
+1) compute  (heavy, per-cluster DFT step)
+   • For each tag (system), read clustered conformer representatives from:
+       e_cluster/<tag>_clusters.tsv
+       e_cluster/<tag>_cluster_<cid>_rep.pdb
+   • For each cluster representative, run (U)KS DFT with PySCF to obtain:
+       - isotropic nuclear shieldings σ_iso
+       - convert σ_iso → chemical shifts δ (ppm) vs TMS
+       - scalar spin–spin couplings J_ij (Hz) via PySCF SSC
+       - ddCOSMO single-point energy (Hartree) for Boltzmann weighting
+   • Write per-cluster outputs under f_predict_shifts/<tag>/ :
+       cluster_<cid>_shifts.tsv
+         atom_idx, atom_name, element, sigma_iso, shift_ppm
+       cluster_<cid>_j_couplings.tsv
+         i, j, label_i, label_j, J_Hz (upper triangle only)
+       cluster_<cid>_J.npy
+         full J matrix [M,M] in Hz
+       cluster_<cid>_J_labels.txt
+         nucleus labels / ordering for that J matrix
+   • Also write per-tag:
+       energies_<solventkey>.tsv
+         cid, energy_Ha (PCM/ddCOSMO single-point energies)
+       params_compute.txt
+         xc/basis/GPU/PCM metadata, and keep_isotopes used for J
 
-  2) average — Fast step:
-     • Reweights precomputed per-cluster shifts with either Boltzmann weights (E_pcm, T)
-       or MD fractions from the cluster table
-     • Produces fast-exchange averaged shifts for any temperature and solvent/epsilon
-     • Runs quickly: no PySCF recomputation required
+   Notes:
+   - Shieldings σ_iso are currently evaluated in gas phase for consistency.
+   - PCM (ddCOSMO) is only used for single-point energies (population weighting).
+   - gpu4pyscf can accelerate SCF. Property evaluation (NMR / SSC) may fall
+     back to CPU internally.
 
-Why split in two?
------------------
-NMR shieldings (gas-phase) are independent of temperature and typically independent
-of PCM in this workflow. The heavy quantum step (“compute”) can be done once and
-reused. Changing *temperature* or *solvent* only affects the weights, so the
-“average” step is lightweight and fast—ideal for scanning conditions.
+2) average  (fast, no new DFT)
+   • Read for each tag:
+       f_predict_shifts/<tag>/cluster_<cid>_shifts.tsv
+       f_predict_shifts/<tag>/energies_<solventkey>.tsv
+       f_predict_shifts/<tag>/cluster_<cid>_J.npy (if present)
+   • Compute weights per cluster:
+       - Boltzmann weights at temperature T using ddCOSMO energies, OR
+       - direct MD fractions from the cluster table (--no-boltz)
+   • Produce fast-exchange weighted averages:
+       fastavg_<solventkey>_<T>K.tsv
+         atom_idx, atom_name, element, shift_ppm  (⟨δ⟩)
+       fastavg_J_<solventkey>_<T>K.npy
+         ⟨J⟩ matrix in Hz (elementwise weighted average of J matrices)
+       fastavg_J_labels.txt
+         nucleus ordering for that ⟨J⟩
+       params_average.txt
+         temperature, solvent key, which weighting was used, etc.
 
-File layout
------------
-Outputs are organized per tag under f_predict_shifts/<tag>/:
+   This step is cheap: it does math and file I/O only, so you can re-run it
+   quickly for different temperatures / solvents / dielectric constants
+   without re-running "compute".
 
-  cluster_<cid>_shifts.tsv          # per-cluster per-atom shieldings & shifts (gas-phase)
-  energies_<solventkey>.tsv         # per-cluster PCM single-point energies (Hartree)
-  fastavg_<solventkey>_<T>K.tsv     # fast-exchange averaged shifts at T (written by "average")
-  params_compute.txt                # record of compute settings (xc/basis/PCM/GPU etc.)
-  params_average.txt                # record of averaging settings (temperature/weights)
+File layout (per tag)
+---------------------
+f_predict_shifts/<tag>/:
+  cluster_<cid>_shifts.tsv
+  cluster_<cid>_j_couplings.tsv
+  cluster_<cid>_J.npy
+  cluster_<cid>_J_labels.txt
+  energies_<solventkey>.tsv
+  fastavg_<solventkey>_<T>K.tsv
+  fastavg_J_<solventkey>_<T>K.npy
+  fastavg_J_labels.txt
+  params_compute.txt
+  params_average.txt
 
-The <solventkey> is either a known solvent name (e.g., "dmso", "cdcl3") or "eps<value>"
-when an explicit dielectric is provided.
+<solventkey> is either:
+  - the lowercase solvent name you passed (e.g. "dmso", "cdcl3"), or
+  - "eps<value>" if you forced a dielectric with --eps
 
-Basic usage
------------
-(1) Heavy step: compute per-cluster shifts and PCM energies
+Typical usage
+-------------
+(1) Heavy per-cluster quantum step:
 
   ./f_predict_shifts.py compute -- --tags aspirin_neutral_cdcl3 \
-      --xc b3lyp --basis def2-tzvp --solvent DMSO --gpu auto --log-level INFO
+      --xc b3lyp --basis def2-tzvp --solvent DMSO --gpu auto \
+      --keep-isotopes 1H
 
-Notes:
-  • Pass flags to the subcommand after a `--`. The main wrapper forwards them.
-  • The compute step:
-      - NMR shieldings/shifts are evaluated in gas phase (for consistency).
-      - PCM ddCOSMO is used for *energies only* (weighting).
-      - If gpu4pyscf is installed and `--gpu on/auto` is set, SCF uses the GPU backend
-        (NMR property evaluation itself may be CPU-bound in many PySCF builds).
+This writes shifts, J couplings, and energies for each cluster of that tag.
 
-(2) Fast step: average at any temperature and solvent
+(2) Average across clusters at chosen temperature / solvent:
 
   ./f_predict_shifts.py average -- --tags aspirin_neutral_cdcl3 \
       --solvent DMSO --temp 298.15
 
-You can rerun “average” as often as you like to change:
-  • Temperature:   --temp 273.15
-  • Solvent name:  --solvent CDCl3
-  • Dielectric:    --eps 20.7  (uses energies_eps20.7.tsv)
-  • Weights mode:  --no-boltz  (use MD fractions from the cluster table)
+This writes fastavg_<solvent>_<temp>K.tsv and fastavg_J_<solvent>_<temp>K.npy.
 
-Required inputs
----------------
-Place the cluster table and representative PDBs in e_cluster/ with names like:
-  e_cluster/<tag>_clusters.tsv
-  e_cluster/<tag>_cluster_<cid>_rep.pdb
+CLI summary for this dispatcher
+-------------------------------
 
-The TSV may include columns such as:
-  cid, fraction (or weight/pop), rep_path (optional)
-If fractions are missing, equal weights are assumed (unless Boltzmann is used in "average").
-
-CLI summary (forwarded to sub-scripts)
---------------------------------------
 compute:
-  --tags TAG [TAG ...]     Tags to process (default: all *_clusters.tsv)
-  --xc XC                  DFT functional (default: b3lyp)
-  --basis BASIS            Basis set (default: def2-tzvp)
-  --gpu {auto,on,off}      GPU SCF via gpu4pyscf if available (default: auto)
-  --solvent NAME           Solvent for PCM energies (e.g., DMSO, CDCl3)
-  --eps EPS                Override dielectric; if set, overrides --solvent
-  --log-level LEVEL        DEBUG, INFO, WARNING, ERROR
-  --quiet                  Reduce informational messages
+  --tags TAG [TAG ...]
+  --xc XC
+  --basis BASIS
+  --gpu {auto,on,off}
+  --solvent NAME
+  --eps EPS
+  --keep-isotopes ISO [ISO ...]     nuclei to include in J (e.g. 1H 13C)
+  --log-level LEVEL
+  --quiet
 
 average:
-  --tags TAG [TAG ...]     Tags to process (default: all *_clusters.tsv)
-  --temp K                 Temperature in Kelvin for Boltzmann weights (default: 298.15)
-  --solvent NAME           Select energies_<solvent>.tsv for weighting
-  --eps EPS                Select energies_eps<EPS>.tsv instead of a solvent name
-  --no-boltz               Use MD fractions instead of Boltzmann weights
-  --log-level LEVEL        DEBUG, INFO, WARNING, ERROR
-  --quiet                  Reduce informational messages
+  --tags TAG [TAG ...]
+  --temp K
+  --solvent NAME
+  --eps EPS
+  --no-boltz
+  --log-level LEVEL
+  --quiet
 
-Troubleshooting
----------------
-• If GPU usage appears low:
-    - The SCF can run on GPU, but NMR response/PCM steps may still be CPU-bound.
-    - Ensure `gpu4pyscf` matches your PySCF/CUDA/CuPy versions; use `--gpu on`.
+Implementation details
+----------------------
+This wrapper dispatches to:
+    f_predict_shifts_compute.main()
+    f_predict_shifts_average.main()
 
-• If a representative PDB cannot be found:
-    - The code expects e_cluster/<tag>_cluster_<cid>_rep.pdb (with a few fallbacks).
-    - Check filenames or provide a 'rep_path' column in the cluster TSV.
+All argument parsing for each sub-step lives in those modules.
 
-This wrapper only dispatches to the sub-scripts. See
-`f_predict_shifts_compute.py` and `f_predict_shifts_average.py` for full flag details.
+An optional `--` after the subcommand is supported for readability:
+    ./f_predict_shifts.py compute -- --tags foo
+is treated the same as:
+    ./f_predict_shifts.py compute --tags foo
+
+No PySCF or other heavy deps are imported here; they live in the sub-scripts.
 """
 
 from __future__ import annotations
 
+import argparse
+import sys
 
-def main():
-    import argparse, sys
 
-    def strip_separators(args):
-        """Remove a single leading '--' and a single '--' right after subcommand."""
-        if args and args[0] == "--":
-            args = args[1:]
-        if args[1:2] == ["--"]:
-            args = args[:1] + args[2:]
-        return args
+def _strip_separators(argv: list[str]) -> list[str]:
+    """
+    Remove one leading '--' if present, and also remove a standalone '--'
+    immediately after the subcommand.
 
+    Examples:
+      ["compute","--","--tags","foo"] -> ["compute","--tags","foo"]
+      ["--","compute","--","--tags","foo"] -> ["compute","--tags","foo"]
+    """
+    out = list(argv)
+    # drop leading --
+    if out and out[0] == "--":
+        out = out[1:]
+    # if we have at least [cmd, "--", ...] collapse that
+    if len(out) >= 2 and out[1] == "--":
+        out = [out[0]] + out[2:]
+    return out
+
+
+def main() -> None:
     PROG = "f_predict_shifts.py"
+
     parser = argparse.ArgumentParser(
         prog=PROG,
-        description="NMR shifts pipeline (compute heavy step, then average reweighting).",
+        description=(
+            "NMR shift / J-coupling pipeline:\n"
+            "  compute  → per-cluster DFT (σ→δ, J, energies)\n"
+            "  average  → Boltzmann/MD fast averaging (δ, J)\n"
+        ),
     )
     sub = parser.add_subparsers(dest="cmd")
 
-    # Declare subcommands (help text only; flags live in the sub-scripts)
-    sub.add_parser("compute", help="Compute per-cluster shifts and PCM energies.")
-    sub.add_parser("average", help="Average precomputed shifts with Boltzmann/MD fractions.")
+    # expose help text for subcommands
+    sub.add_parser(
+        "compute",
+        help="Compute per-cluster shieldings→shifts, J couplings, and PCM energies.",
+    )
+    sub.add_parser(
+        "average",
+        help="Average precomputed shifts and J with Boltzmann/MD fractions.",
+    )
 
     if len(sys.argv) == 1:
+        # Just print high-level help plus quick examples.
         parser.print_help(sys.stderr)
-        print(r"""
+        print(
+            r"""
 Examples:
 
-  # 1) Heavy step: per-cluster NMR & PCM energies (GPU on if available)
-  ./f_predict_shifts.py compute --tags aspirin_neutral_cdcl3 --xc b3lyp --basis def2-tzvp --solvent DMSO --gpu auto
+  # 1) Heavy step: per-cluster NMR, J, and PCM energies (GPU if available)
+  ./f_predict_shifts.py compute -- --tags aspirin_neutral_cdcl3 \
+      --xc b3lyp --basis def2-tzvp --solvent DMSO --gpu auto \
+      --keep-isotopes 1H
 
-  # 1a) Same as above with a separator after the subcommand
-  ./f_predict_shifts.py compute -- --tags aspirin_neutral_cdcl3 --xc b3lyp --basis def2-tzvp --solvent DMSO --gpu auto
-
-  # 2) Fast step: average at chosen temperature and solvent
-  ./f_predict_shifts.py average --tags aspirin_neutral_cdcl3 --solvent DMSO --temp 298.15
-""")
+  # 2) Fast step: average at chosen temperature / solvent
+  ./f_predict_shifts.py average -- --tags aspirin_neutral_cdcl3 \
+      --solvent DMSO --temp 298.15
+"""
+        )
         return
 
-    # Strip optional separators and split into [cmd] + [rest]
-    argv = strip_separators(sys.argv[1:])
+    # normalize argv:
+    argv = _strip_separators(sys.argv[1:])
     if not argv:
-        parser.print_help(sys.stderr);
+        parser.print_help(sys.stderr)
         return
-    cmd, rest = argv[0], argv[1:]
 
-    # One more pass in case user wrote: "compute -- --tags ..."
-    rest = strip_separators([cmd] + rest)[1:]
+    # first token should be the subcommand
+    cmd = argv[0]
+    rest = argv[1:]
 
-    # Dispatch
+    # in case user did "<cmd> -- --tags ...", strip again
+    rest = _strip_separators([cmd] + rest)[1:]
+
     dispatch = {
         "compute": ("f_predict_shifts_compute", "f_predict_shifts_compute.py"),
         "average": ("f_predict_shifts_average", "f_predict_shifts_average.py"),
     }
+
     if cmd not in dispatch:
         parser.print_help(sys.stderr)
-        print(f"\n[error] Unknown subcommand: {cmd!r}. Use 'compute' or 'average'.")
+        print(
+            f"\n[error] Unknown subcommand: {cmd!r}. "
+            "Use 'compute' or 'average'."
+        )
         return
 
-    module_name, prog_name = dispatch[cmd]
+    (module_name, child_prog) = dispatch[cmd]
+
+    # Import lazily and hand off to the real main()
     module = __import__(module_name, fromlist=["main"])
-    sys.argv = [prog_name] + rest
+    sys.argv = [child_prog] + rest
     return module.main()
 
 

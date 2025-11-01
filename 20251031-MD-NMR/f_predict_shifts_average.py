@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# f_predict_shifts_average.py
+
 # Average (fast step): Boltzmann or MD-fraction weights → fast-exchange shifts
 # 2025-11-01
 
