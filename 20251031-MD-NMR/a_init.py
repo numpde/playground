@@ -19,7 +19,7 @@ OUT_DIR = mkdir(Path(__file__).with_suffix(''))
 # - neutral (COOH)
 # - deprotonated (COO-)  ← dominant around pH ~7 in water
 ASPIRIN_NEUTRAL = "CC(=O)OC1=CC=CC=C1C(=O)O"
-ASPIRIN_DEPROT  = "CC(=O)OC1=CC=CC=C1C(=O)[O-]"
+ASPIRIN_DEPROT  = None  # "CC(=O)OC1=CC=CC=C1C(=O)[O-]"
 
 # Strychnine:
 # You currently use this neutral SMILES (free base). :contentReference[oaicite:1]{index=1}
@@ -102,20 +102,22 @@ def build_targets() -> List[Dict]:
     # Aspirin
     targets.append(
         _state_dict(
-            name='aspirin_deprot',             # water-like / physiological pH
-            smiles=ASPIRIN_DEPROT,
-            charge_hint=-1,
-            pdb_name='aspirin_deprot_init.pdb',
-        )
-    )
-    targets.append(
-        _state_dict(
             name='aspirin_neutral',            # nonpolar solvent, low pH
             smiles=ASPIRIN_NEUTRAL,
             charge_hint=0,
             pdb_name='aspirin_neutral_init.pdb',
         )
     )
+
+    if ASPIRIN_DEPROT is not None:
+        targets.append(
+            _state_dict(
+                name='aspirin_deprot',  # water-like / physiological pH
+                smiles=ASPIRIN_DEPROT,
+                charge_hint=-1,
+                pdb_name='aspirin_deprot_init.pdb',
+            )
+        )
 
     # Strychnine
     targets.append(
