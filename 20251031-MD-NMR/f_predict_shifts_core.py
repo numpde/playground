@@ -656,42 +656,69 @@ def _optimize_geometry_cpu(
     Return Cartesian coords (Å) for TMS suitable for use as a reference.
 
     Policy:
-      - If Berny geometry optimization is available and succeeds, use that.
-      - Otherwise, DO NOT half-relax with a crude gradient step (that
-        breaks Td symmetry and creates multiple inequivalent methyls).
-        Instead, just return the symmetric analytic guess unchanged.
+      - Try Berny geometry optimization (B3LYP/def2-TZVP or whatever xc/basis).
+        Handle all observed PySCF return conventions:
+          * mol
+          * (converged_flag, mol)
+          * (mol, extra_info)
+      - If anything goes wrong, fall back to the symmetric analytic TMS guess
+        (coords_A_init), which we already know is internally consistent and
+        gives δ(TMS) ≈ 0 ppm.
 
     Rationale:
-      For referencing, internal self-consistency matters more than
-      micro-optimizing bond lengths. We want all 13C nuclei in TMS to
-      be equivalent so that δ(TMS) ≈ 0 ppm for every carbon and proton.
+      We care about internal consistency of the reference.
+      Berny gives a physically relaxed TMS; if that fails, we keep the
+      perfectly symmetric Td guess rather than a half-broken geometry.
     """
-    # Build initial mol on CPU
     mol0 = make_mol(syms, coords_A_init, charge, spin, basis)
 
-    # Plain CPU SCF to make sure the guess is at least sane
+    # plain CPU SCF first, to have a sane starting wavefunction
     mf0 = build_scf(mol0, xc, use_gpu=False)
     _ = mf0.kernel()
 
-    # Try Berny optimization if available
     if BERNY_AVAILABLE:
         try:
             from pyscf.geomopt.berny_solver import kernel as berny_kernel  # type: ignore
-            mol_opt = berny_kernel(mf0, assert_convergence=True)
+
+            berny_ret = berny_kernel(mf0, assert_convergence=True)
+
+            # Unwrap berny_ret into an actual Mole-like object with .atom_coords(...)
+            mol_candidate = None
+
+            if hasattr(berny_ret, "atom_coords"):
+                # classic API: kernel(...) -> mol
+                mol_candidate = berny_ret
+
+            elif isinstance(berny_ret, tuple):
+                # possibilities:
+                #   (converged_flag, mol)
+                #   (mol, loginfo)
+                # We'll scan both elements and pick the one that looks like a Mole.
+                for item in berny_ret:
+                    if hasattr(item, "atom_coords"):
+                        mol_candidate = item
+                        break
+
+            if mol_candidate is None:
+                raise RuntimeError(
+                    f"Could not extract optimized Mole from berny_ret={type(berny_ret)}"
+                )
+
             coords_opt = np.asarray(
-                mol_opt.atom_coords(unit="Angstrom"),
+                mol_candidate.atom_coords(unit="Angstrom"),
                 dtype=float,
             )
             return coords_opt
+
         except Exception as e:
+            # Berny ran or partially ran but we couldn't parse it
             LOG.warning(
-                "Berny optimization failed (%s); "
+                "Berny optimization failed (%r); "
                 "falling back to symmetric guess.",
                 e,
             )
 
-    # Fallback: keep the original symmetric guess EXACTLY.
-    # Do NOT apply a manual gradient step.
+    # Fallback: keep the symmetric analytic Td guess unchanged
     LOG.warning(
         "Berny geometry optimization not available; "
         "using unoptimized symmetric TMS guess for reference."
