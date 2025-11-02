@@ -64,7 +64,6 @@ from f_predict_shifts_core import (
     load_clusters_table,
     read_pdb_atoms,
     sigma_to_delta,
-    sp_energy_pcm,
     tms_ref_sigma,
     write_cluster_shifts,
     write_j_couplings,
