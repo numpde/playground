@@ -608,22 +608,27 @@ def _optimize_geometry_cpu(
         basis: str,
 ) -> np.ndarray:
     """
-    Return Cartesian coords (Å) for TMS suitable for use as a reference.
+    Attempt to return a Berny-relaxed Cartesian geometry (Å).
+
+    This is ONLY called when the caller explicitly allows TMS optimization.
 
     Policy:
-      - Try Berny geometry optimization (B3LYP/def2-TZVP or whatever xc/basis).
+      - Try Berny geometry optimization at the requested xc/basis.
         Handle all observed PySCF return conventions:
           * mol
           * (converged_flag, mol)
           * (mol, extra_info)
-      - If anything goes wrong, fall back to the symmetric analytic TMS guess
-        (coords_A_init), which we already know is internally consistent and
-        gives δ(TMS) ≈ 0 ppm.
 
-    Rationale:
-      We care about internal consistency of the reference.
-      Berny gives a physically relaxed TMS; if that fails, we keep the
-      perfectly symmetric Td guess rather than a half-broken geometry.
+      - If anything goes wrong, fall back to the symmetric analytic TMS guess
+        (coords_A_init), which is internally self-consistent and gives
+        δ(TMS) ≈ 0 ppm.
+
+    We do not raise on Berny failure. We warn and degrade gracefully.
+
+    Returns
+    -------
+    coords_opt : np.ndarray, shape (natm, 3)
+        Final Cartesian coordinates in Å.
     """
     mol0 = make_mol(syms, coords_A_init, charge, spin, basis)
 
@@ -681,61 +686,89 @@ def _optimize_geometry_cpu(
     return np.asarray(coords_A_init, dtype=float)
 
 
-@lru_cache(maxsize=8)
-def tms_geometry(xc: str, basis: str) -> Tuple[List[str], np.ndarray]:
+@lru_cache(maxsize=16)
+def tms_geometry(xc: str, basis: str, do_opt: bool) -> Tuple[List[str], np.ndarray]:
     """
-    Return an optimized TMS geometry for (xc,basis), in Å.
+    Return a TMS geometry for (xc,basis) in Å, with optional Berny relaxation.
 
-    Steps:
-      1. build an initial Si(CH3)4 guess
-      2. run a CPU geometry optimization with the same xc/basis
-         (Berny if available, else a warned single-step relax)
-      3. cache result so we don't re-opt every cluster
+    Parameters
+    ----------
+    xc : str
+        DFT functional.
+    basis : str
+        Basis set.
+    do_opt : bool
+        If True:
+            - Build an analytic symmetric Td Si(CH3)4 guess.
+            - Try Berny geometry optimization with the given xc/basis.
+            - On failure, fall back to the symmetric guess and WARN.
+        If False (default in the pipeline):
+            - Build the symmetric Td guess ONLY.
+            - Do NOT call Berny at all.
 
-    We *do not* silently fall back to a crude hand-drawn TMS unless
-    even the fallback fails; and in that case we have already WARNed.
+    Notes
+    -----
+    We cache on (xc,basis,do_opt) so the cost is paid once.
+
+    Returns
+    -------
+    (syms, coords_A_opt)
+        syms        list[str]   atomic symbols
+        coords_A_opt np.ndarray (natm,3) Å
     """
     (syms0, coords0_A) = _tms_guess_geometry()
-    coords_opt_A = _optimize_geometry_cpu(
-        syms0,
-        coords0_A,
-        charge=0,
-        spin=0,
-        xc=xc,
-        basis=basis,
-    )
-    return (syms0, coords_opt_A)
+
+    if do_opt:
+        coords_out_A = _optimize_geometry_cpu(
+            syms0,
+            coords0_A,
+            charge=0,
+            spin=0,
+            xc=xc,
+            basis=basis,
+        )
+    else:
+        # Fast path: skip Berny entirely.
+        coords_out_A = np.asarray(coords0_A, dtype=float)
+
+    return (syms0, coords_out_A)
 
 
-@lru_cache(maxsize=8)
-def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
+@lru_cache(maxsize=16)
+def tms_ref_sigma(xc: str, basis: str, do_opt: bool) -> Dict[str, float]:
     """
-    Return the reference isotropic shieldings σ_ref for TMS at (xc, basis),
-    as {'H': <σ_H>, 'C': <σ_C>}.
+    Compute and cache the reference isotropic shieldings σ_ref for TMS at
+    (xc,basis), as {'H': <σ_H>, 'C': <σ_C>}.
 
-    How this works:
-    1. Build (and Berny-optimize if possible) TMS geometry for this xc/basis.
-    2. Run the SAME heavy pipeline we use in production,
-       i.e. compute_sigma_J_and_energy_once(...), but:
-         - force CPU (use_gpu=False),
-         - skip J (need_J=False),
-         - no PCM (eps=None).
-       That gives us per-atom σ_iso for all atoms in that optimized TMS.
-    3. Average all 1H shieldings → σ_ref['H']
-       Average all 13C shieldings → σ_ref['C']
+    This is what defines δ(ppm) via δ = σ_ref - σ.
 
-    If Berny fails, we fall back to the symmetric Td TMS guess. That geometry
-    is internally self-consistent, so δ(TMS) should still come out ~0 ppm
-    for both 1H and 13C at this level of theory.
+    Behavior depends on do_opt:
 
-    The result is cached so we only pay this cost once per (xc,basis).
+    - do_opt == False (default in compute):
+        Use the symmetric analytic Td TMS (no Berny). Skip any geometry
+        optimization entirely. This keeps the run cheap and deterministic.
+
+    - do_opt == True (--tms-opt flag):
+        Attempt Berny geometry optimization of TMS at (xc,basis).
+        If Berny fails or is unavailable, fall back to the symmetric Td guess
+        and WARN.
+
+    After we get the geometry:
+        1. Run the standard single-shot pipeline on CPU:
+            compute_sigma_J_and_energy_once(...)
+            with need_J=False, eps=None.
+        2. Extract all 1H σ_iso → average → σ_ref['H'].
+        3. Extract all 13C σ_iso → average → σ_ref['C'].
+
+    Returns
+    -------
+    ref_sigma : dict
+        {'H': float, 'C': float}
     """
-
-    # 1. Get best-known TMS geometry for this level of theory
-    (syms, coords_A) = tms_geometry(xc, basis)
+    # 1. Get TMS geometry per requested policy
+    (syms, coords_A) = tms_geometry(xc, basis, do_opt)
 
     # 2. Single-shot SCF → σ_iso using the unified path.
-    #    We don't care about J or PCM energy here.
     (
         sigma_iso,
         _J_unused,
@@ -760,7 +793,7 @@ def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
 
     if not Hvals or not Cvals:
         raise RuntimeError(
-            "tms_ref_sigma(): TMS shielding missing H or C after optimization"
+            "tms_ref_sigma(): TMS shielding missing H or C after reference calc"
         )
 
     ref_H = float(np.mean(Hvals))
