@@ -686,19 +686,94 @@ def _build_J_matrix_Hz(
         isotopes_keep: Sequence[str],
 ) -> Tuple[np.ndarray, List[str]]:
     """
-    Run SSC on a CPU MF, construct an isotropic scalar coupling matrix (Hz),
-    and slice it down to the specified nuclei.
+    Compute an isotropic scalar J-coupling matrix (Hz) from a CPU mean-field.
+
+    We tolerate multiple PySCF SSC output formats:
+      1) ndarray shape (natm, natm)                    ← direct scalar Hz
+      2) ndarray shape (n_pairs, 3, 3)                 ← per-pair 3x3 tensors
+      3) dict[(ia, ja)] = scalar or tensor-like value  ← mixed/legacy
+
+    For case (2), we assume pairs are ordered over i<j in the upper triangle.
+    The scalar J_ij is taken as trace(tensor)/3 (Hz).
+
+    The returned matrix is then subset to the requested isotopes.
+
     Returns:
-        J_Hz      (M,M) dense symmetric matrix, Hz
-        labels    list[str] labels per nucleus in that order
+        (J_sel, keep_labels)
+        J_sel      (M,M) symmetric ndarray in Hz
+        keep_labels list[str] nucleus labels matching rows/cols in J_sel
     """
+
+    def _iso_from_tensor(val) -> float:
+        """
+        Reduce whatever SSC.kernel() gave us for a pair (ia,ja)
+        to an isotropic scalar J in Hz.
+        """
+        arr = np.asarray(val, dtype=float)
+
+        # scalar already
+        if arr.ndim == 0:
+            return float(arr)
+
+        # full 3x3 tensor → trace/3
+        if arr.ndim == 2 and arr.shape == (3, 3):
+            return float(np.trace(arr) / 3.0)
+
+        # length-3 vector or arbitrary small thing → mean as fallback
+        if arr.ndim == 1 and arr.shape[0] == 3:
+            return float(np.mean(arr))
+
+        # last-resort fallback (robust against PySCF shape drift)
+        return float(np.mean(arr))
+
+    # run SSC on this MF
     ssc_driver = _pick_ssc_driver(mf_cpu)
     raw = ssc_driver.kernel()
 
-    # select which nuclei to keep
-    symbols = [a[0] for a in mf_cpu.mol._atom]
+    natm = mf_cpu.mol.natm
+    J_full = np.zeros((natm, natm), dtype=float)
 
-    # common NMR-active isotopes for labeling
+    # Format 1: full natm×natm array already in Hz
+    if isinstance(raw, np.ndarray) and raw.ndim == 2:
+        if raw.shape != (natm, natm):
+            raise RuntimeError(
+                f"SSC kernel ndarray shape {raw.shape} "
+                f"!= ({natm},{natm}); don't know how to map."
+            )
+        J_full[:, :] = np.asarray(raw, dtype=float)
+
+    # Format 2: per-pair anisotropic tensors, e.g. (n_pairs,3,3)
+    elif isinstance(raw, np.ndarray) and raw.ndim == 3 and raw.shape[1:] == (3, 3):
+        n_pairs_expected = natm * (natm - 1) // 2
+        if raw.shape[0] != n_pairs_expected:
+            raise RuntimeError(
+                f"SSC kernel ndarray shape {raw.shape} doesn't match "
+                f"{n_pairs_expected} unique pairs for natm={natm}."
+            )
+        k = 0
+        for i in range(natm):
+            for j in range(i + 1, natm):
+                Jij_iso_Hz = _iso_from_tensor(raw[k])
+                J_full[i, j] = Jij_iso_Hz
+                J_full[j, i] = Jij_iso_Hz
+                k += 1
+
+    # Format 3: dict[(ia,ja)] = scalar/tensor
+    elif isinstance(raw, dict):
+        for (ia, ja), val in raw.items():
+            Jij_iso_Hz = _iso_from_tensor(val)
+            J_full[ia, ja] = Jij_iso_Hz
+            J_full[ja, ia] = Jij_iso_Hz
+
+    else:
+        raise RuntimeError(
+            f"SSC kernel() return type {type(raw)} / shape "
+            f"{getattr(getattr(raw, 'shape', None), '__str__', lambda: '?')()} "
+            "not recognized."
+        )
+
+    # Decide which nuclei to keep (1H-only special case, or explicit isotopes)
+    symbols = [a[0] for a in mf_cpu.mol._atom]
     iso_map = {
         "H": "1H",
         "C": "13C",
@@ -720,45 +795,15 @@ def _build_J_matrix_Hz(
             if el.upper() == "H":
                 keep_idx.append(i)
                 keep_labels.append(f"H{i + 1}")
-            continue
-
-        iso_guess = iso_map.get(el.capitalize())
-        if iso_guess in isotopes_keep:
-            keep_idx.append(i)
-            keep_labels.append(f"{el}{i + 1}")
+        else:
+            iso_guess = iso_map.get(el.capitalize())
+            if iso_guess in isotopes_keep:
+                keep_idx.append(i)
+                keep_labels.append(f"{el}{i + 1}")
 
     if not keep_idx:
+        # Nothing requested (or no matches). Return empty.
         return np.zeros((0, 0), dtype=float), []
-
-    natm = mf_cpu.mol.natm
-
-    # case: ndarray [natm, natm]
-    if isinstance(raw, np.ndarray):
-        if raw.shape[0] != natm or raw.shape[1] != natm:
-            raise RuntimeError(
-                f"SSC kernel ndarray shape {raw.shape} != ({natm},{natm})"
-            )
-        J_full = np.asarray(raw, dtype=float)
-
-    # case: dict[(ia,ja)] = scalar or tensor
-    elif isinstance(raw, dict):
-        J_full = np.zeros((natm, natm), dtype=float)
-        for (ia, ja), val in raw.items():
-            if np.isscalar(val):
-                Jij_iso_Hz = float(val)
-            else:
-                arr = np.asarray(val, dtype=float)
-                if arr.ndim == 2 and arr.shape == (3, 3):
-                    Jij_iso_Hz = float(np.trace(arr) / 3.0)
-                else:
-                    Jij_iso_Hz = float(np.mean(arr))
-            J_full[ia, ja] = Jij_iso_Hz
-            J_full[ja, ia] = Jij_iso_Hz
-
-    else:
-        raise RuntimeError(
-            f"SSC kernel() return type {type(raw)} not understood"
-        )
 
     sel = np.array(keep_idx, dtype=int)
     J_sel = J_full[np.ix_(sel, sel)].astype(float)
@@ -802,21 +847,60 @@ def assert_ssc_available_fast(
         isotopes_keep: Sequence[str],
 ) -> None:
     """
-    Lightweight probe so callers can decide early whether SSC/J is usable.
+    Fast 'can I do J couplings at all?' probe.
 
-    We build a tiny 2-atom system, run SCF on CPU, bounce to CPU MF,
-    and try to build a J matrix. If this fails, callers can either abort
-    (--require-j) or continue with J disabled.
+    We build a tiny H2-like system, run an SCF on pure CPU, then attempt:
+      - _property_on_cpu()
+      - _build_J_matrix_Hz()
+
+    This is considered SUCCESS if:
+      - no exception is raised, and
+      - we get a finite (possibly 1x1 or 2x2) J matrix for the requested nuclei.
+
+    Any RuntimeError here means 'J is not reliably available', which lets the
+    caller abort early if --require-j was set.
     """
+    # minimal 2-proton system
     symbols = ["H", "H"]
     coords_A = np.array([[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]], dtype=float)
+    charge = 0
+    spin = 0
 
-    mol = make_mol(symbols, coords_A, charge=0, spin=0, basis=basis)
+    mol = make_mol(symbols, coords_A, charge=charge, spin=spin, basis=basis)
+
+    # force CPU here: we only care about SSC plumbing, not GPU perf
     mf = build_scf(mol, xc, use_gpu=False)
     _ = mf.kernel()
+
     mf_cpu = _property_on_cpu(mol, mf, xc)
 
-    _ = _build_J_matrix_Hz(mf_cpu, isotopes_keep=isotopes_keep)
+    (J_test, lbl_test) = _build_J_matrix_Hz(
+        mf_cpu,
+        isotopes_keep=isotopes_keep,
+    )
+
+    # Check that dimensions line up with labels and values are finite.
+    if J_test.shape[0] != J_test.shape[1]:
+        raise RuntimeError(
+            f"SSC sanity check: non-square J matrix {J_test.shape}"
+        )
+    if J_test.shape[0] != len(lbl_test):
+        raise RuntimeError(
+            "SSC sanity check: label/matrix size mismatch "
+            f"{J_test.shape[0]} vs {len(lbl_test)}"
+        )
+    if J_test.size > 0 and not np.all(np.isfinite(J_test)):
+        raise RuntimeError(
+            "SSC sanity check: J matrix has non-finite values"
+        )
+
+    # If we get here: SSC path is judged usable for production.
+    LOG.debug(
+        "SSC preflight OK: %d spins [%s], J matrix %s",
+        len(lbl_test),
+        ", ".join(lbl_test),
+        J_test.shape,
+    )
 
 
 # -----------------------------------------------------------------------------
