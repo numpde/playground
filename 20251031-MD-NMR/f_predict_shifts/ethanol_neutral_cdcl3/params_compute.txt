@@ -1,0 +1,10 @@
+xc: b3lyp
+basis: def2-tzvp
+charge_spin: (0, 0)
+gpu: True
+pcm_eps: 4.81
+solvent_key: cdcl3
+keep_isotopes: ['1H']
+ssc_available: 1
+notes: Per-cluster shieldings σ_iso and δ(ppm), scalar J couplings (Hz, if ssc_available=1), and ddCOSMO single-point energies (Hartree) for Boltzmann weighting.
+spin_label_order: ['H4', 'H5', 'H6', 'H7', 'H8', 'H9']
