@@ -480,51 +480,6 @@ def nmr_tensors_from_mf(mf):
 # Shielding → δ ppm
 # -----------------------------------------------------------------------------
 
-def compute_sigma_iso(
-        symbols: Sequence[str],
-        coords_A: np.ndarray,
-        charge: int,
-        spin: int,
-        xc: str,
-        basis: str,
-        use_gpu: bool,
-) -> np.ndarray:
-    """
-    Return isotropic shielding σ_iso[i] for each nucleus.
-    We run SCF (GPU if allowed), then try shielding on that MF. If the GPU MF
-    can't do shielding, we bounce to a CPU MF and retry.
-    """
-    mol = make_mol(symbols, coords_A, charge, spin, basis)
-    mf = build_scf(mol, xc, use_gpu=use_gpu)
-    _ = mf.kernel()
-
-    try:
-        arr = np.asarray(nmr_tensors_from_mf(mf))
-    except Exception:
-        LOG.debug(
-            "NMR not available on %s; falling back to CPU MF for property.",
-            mf.__class__,
-        )
-        mf_cpu = _property_on_cpu(mol, mf, xc)
-        arr = np.asarray(nmr_tensors_from_mf(mf_cpu))
-
-    # Normalization of output formats from PySCF:
-    # [natm,3,3] full tensor -> trace/3
-    # [natm] already isotropic
-    # [natm,3] -> mean of the 3 components
-    if arr.ndim == 3 and arr.shape[-1] == 3:
-        sigma_iso = (np.trace(arr, axis1=1, axis2=2) / 3.0).astype(float)
-    elif arr.ndim == 1:
-        sigma_iso = arr.astype(float)
-    elif arr.ndim == 2 and arr.shape[1] == 3:
-        sigma_iso = arr.mean(axis=1).astype(float)
-    else:
-        sigma_iso = (
-            np.diagonal(arr, axis1=-2, axis2=-1).mean(axis=-1).astype(float)
-        )
-
-    return sigma_iso
-
 
 def sigma_to_delta(
         symbols: Sequence[str],
@@ -755,40 +710,58 @@ def tms_geometry(xc: str, basis: str) -> Tuple[List[str], np.ndarray]:
 @lru_cache(maxsize=8)
 def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
     """
-    Compute and cache σ_ref for TMS at (xc,basis).
+    Return the reference isotropic shieldings σ_ref for TMS at (xc, basis),
+    as {'H': <σ_H>, 'C': <σ_C>}.
 
-    We intentionally reuse the exact same pipeline as production:
-    - same SCF path (including GPU→CPU handoff logic),
-    - same shielding extraction logic,
-    - same per-atom sigma_iso definition.
+    How this works:
+    1. Build (and Berny-optimize if possible) TMS geometry for this xc/basis.
+    2. Run the SAME heavy pipeline we use in production,
+       i.e. compute_sigma_J_and_energy_once(...), but:
+         - force CPU (use_gpu=False),
+         - skip J (need_J=False),
+         - no PCM (eps=None).
+       That gives us per-atom σ_iso for all atoms in that optimized TMS.
+    3. Average all 1H shieldings → σ_ref['H']
+       Average all 13C shieldings → σ_ref['C']
 
-    That guarantees that if we run TMS itself through the main
-    compute path and then convert σ→δ using this σ_ref, all TMS
-    1H and 13C should come out near 0 ppm.
+    If Berny fails, we fall back to the symmetric Td TMS guess. That geometry
+    is internally self-consistent, so δ(TMS) should still come out ~0 ppm
+    for both 1H and 13C at this level of theory.
+
+    The result is cached so we only pay this cost once per (xc,basis).
     """
 
-    # 1. Get (possibly optimized) TMS geometry for this level of theory
+    # 1. Get best-known TMS geometry for this level of theory
     (syms, coords_A) = tms_geometry(xc, basis)
 
-    # 2. Run the unified sigma/J routine ONCE on CPU (use_gpu=False here is fine)
-    (sigma_iso, _J_dummy, _labels_dummy) = compute_sigma_and_J_once(
+    # 2. Single-shot SCF → σ_iso using the unified path.
+    #    We don't care about J or PCM energy here.
+    (
+        sigma_iso,
+        _J_unused,
+        _lbl_unused,
+        _e_unused,
+    ) = compute_sigma_J_and_energy_once(
         symbols=syms,
         coords_A=coords_A,
         charge=0,
         spin=0,
         xc=xc,
         basis=basis,
-        use_gpu=False,
-        isotopes_keep=["1H", "13C"],
-        need_J=False,
+        use_gpu=False,  # CPU is fine for this tiny system
+        isotopes_keep=["1H", "13C"],  # unused when need_J=False
+        need_J=False,  # skip SSC entirely
+        eps=None,  # gas-phase energy only
     )
 
-    # 3. Average per-element shielding to get σ_ref
+    # 3. Element-wise averages to define σ_ref
     Hvals = [sigma_iso[i] for (i, s) in enumerate(syms) if s.upper() == "H"]
     Cvals = [sigma_iso[i] for (i, s) in enumerate(syms) if s.upper() == "C"]
 
     if not Hvals or not Cvals:
-        raise RuntimeError("TMS σ_ref: missing H or C after optimization")
+        raise RuntimeError(
+            "tms_ref_sigma(): TMS shielding missing H or C after optimization"
+        )
 
     ref_H = float(np.mean(Hvals))
     ref_C = float(np.mean(Cvals))
@@ -977,119 +950,6 @@ def _build_J_matrix_Hz(
     J_sel = J_full[np.ix_(sel, sel)].astype(float)
 
     return (J_sel, keep_labels)
-
-
-def compute_spinspin_JHz(
-        symbols: Sequence[str],
-        coords_A: np.ndarray,
-        charge: int,
-        spin: int,
-        xc: str,
-        basis: str,
-        use_gpu: bool,
-        isotopes_keep: Sequence[str],
-) -> Tuple[np.ndarray, List[str]]:
-    """
-    Compute scalar spin–spin couplings (Hz) for selected isotopes.
-
-    Steps:
-      1. build mol and run SCF (GPU if allowed)
-      2. construct an equivalent CPU MF (property_on_cpu)
-      3. run SSC and build dense J matrix (Hz)
-      4. keep only requested isotopes
-    """
-    mol = make_mol(symbols, coords_A, charge, spin, basis)
-
-    mf = build_scf(mol, xc, use_gpu=use_gpu)
-    _ = mf.kernel()
-
-    mf_cpu = _property_on_cpu(mol, mf, xc)
-    (J_Hz, labels) = _build_J_matrix_Hz(mf_cpu, isotopes_keep=isotopes_keep)
-
-    return (J_Hz, labels)
-
-
-def compute_sigma_and_J_once(
-        symbols: Sequence[str],
-        coords_A: np.ndarray,
-        charge: int,
-        spin: int,
-        xc: str,
-        basis: str,
-        use_gpu: bool,
-        isotopes_keep: Sequence[str],
-        need_J: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """
-    Compute BOTH, with a single expensive SCF:
-
-      - per-atom isotropic shielding σ_iso (for chemical shifts)
-      - scalar spin–spin coupling matrix J (Hz) for selected isotopes
-
-    Steps:
-      1. build mol
-      2. run SCF once (GPU if allowed)
-      3. clone to CPU MF via _property_on_cpu(...)
-      4. from that SAME CPU MF:
-         - NMR shielding tensors → σ_iso
-         - SSC → J_Hz (if need_J)
-
-    If need_J is False, we skip SSC entirely and return
-    J_Hz = array([]).reshape(0,0), labels = [].
-
-    Returns:
-        (sigma_iso, J_Hz, labels)
-
-        sigma_iso : (natm,) float
-            isotropic shielding for each atom in `symbols`
-
-        J_Hz : (M,M) float
-            dense symmetric J matrix in Hz for the kept nuclei
-            (0x0 if need_J is False)
-
-        labels : list[str] length M
-            nucleus labels ("H12", "C3", ...) matching rows/cols of J_Hz
-            ([] if need_J is False)
-    """
-    # 1. Molecule
-    mol = make_mol(symbols, coords_A, charge, spin, basis)
-
-    # 2. SCF once (GPU-capable mf)
-    mf = build_scf(mol, xc, use_gpu=use_gpu)
-    _ = mf.kernel()
-
-    # 3. CPU clone seeded from that SCF density
-    mf_cpu = _property_on_cpu(mol, mf, xc)
-
-    # 4a. Shieldings from mf_cpu
-    arr = np.asarray(nmr_tensors_from_mf(mf_cpu))
-
-    if arr.ndim == 3 and arr.shape[-1] == 3:
-        # full 3x3 tensors → trace/3
-        sigma_iso = (np.trace(arr, axis1=1, axis2=2) / 3.0).astype(float)
-    elif arr.ndim == 1:
-        # already isotropic per atom
-        sigma_iso = arr.astype(float)
-    elif arr.ndim == 2 and arr.shape[1] == 3:
-        # principal components → mean
-        sigma_iso = arr.mean(axis=1).astype(float)
-    else:
-        # fallback: mean of diagonal elements
-        sigma_iso = (
-            np.diagonal(arr, axis1=-2, axis2=-1).mean(axis=-1).astype(float)
-        )
-
-    # 4b. Optional spin–spin couplings on the SAME mf_cpu
-    if need_J:
-        (J_Hz, labels) = _build_J_matrix_Hz(
-            mf_cpu,
-            isotopes_keep=isotopes_keep,
-        )
-    else:
-        J_Hz = np.zeros((0, 0), dtype=float)
-        labels = []
-
-    return (sigma_iso, J_Hz, labels)
 
 
 def compute_sigma_J_and_energy_once(

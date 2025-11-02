@@ -68,7 +68,7 @@ from f_predict_shifts_core import (
     write_cluster_shifts,
     write_j_couplings,
     write_params,
-    assert_ssc_available_fast, compute_sigma_and_J_once,
+    assert_ssc_available_fast,
 )
 
 LOG = logging.getLogger("nmrshifts.compute")
