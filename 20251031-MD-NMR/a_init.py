@@ -19,6 +19,9 @@ except ImportError:
 
 OUT_DIR = mkdir(Path(__file__).with_suffix(''))
 
+# Tiny fast sanity-check system
+ETHANOL_NEUTRAL = "CCO"  # CH3-CH2-OH, neutral
+
 # Aspirin:
 # - neutral (COOH)
 # - deprotonated (COO-)  ← dominant around pH ~7 in water
@@ -102,6 +105,16 @@ def build_targets() -> List[Dict]:
     Each entry becomes its own system later (solvation, MD, clustering).
     """
     targets: List[Dict] = []
+
+    # --- tiny / fast test case ---------------------------------
+    targets.append(
+        _state_dict(
+            name='ethanol_neutral',
+            smiles=ETHANOL_NEUTRAL,
+            charge_hint=0,
+            pdb_name='ethanol_neutral_init.pdb',
+        )
+    )
 
     # Aspirin
     targets.append(
