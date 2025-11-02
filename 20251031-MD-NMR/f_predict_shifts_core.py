@@ -884,23 +884,30 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     """
     Build scalar J-coupling matrix (Hz) for the nuclei in `isotopes_keep`.
 
-    Key change:
-    We now *temporarily raise* the SpinSpinCoupling driver's verbosity before
-    calling .kernel(), so PySCF will actually print the human-readable
-    "Spin-spin coupling constant J (Hz)" table even if mf_cpu was created
-    with verbose=0. We capture that stdout and parse it first.
+    Critical behavior:
+    - We *force-verbose* the PySCF SpinSpinCoupling driver and temporarily
+      replace its .stdout with an in-memory buffer so that PySCF will
+      actually print the "Spin-spin coupling constant J (Hz)" table to us.
+      This is necessary because our mf_cpu is usually quiet (verbose=0),
+      so by default PySCF prints nothing.
+    - We then parse that printed table as the authoritative Hz couplings.
 
-    Diagnostics are returned so the caller can decide to abort if J looks bad.
+    Fallbacks:
+    - If we still can't parse a table, we fall back to decoding the raw
+      return of .kernel() (pair tensors etc.), using nuc_pair if present.
+      That branch is less reliable across PySCF versions and may not be in Hz.
+
+    We return diagnostics so the caller can decide if values are usable.
 
     Returns
     -------
     (J_sel, keep_labels, diag)
         J_sel         np.ndarray (M,M), Hz
-        keep_labels   list[str]  ["H4","H5",...]
+        keep_labels   list[str]  ["H4","H5", ...]
         diag          dict {
                            'raw_type': str(...),
-                           'raw_ndarray_info' or 'raw_attrs': ...,
                            'driver_attrs': [...],
+                           'raw_ndarray_info' or 'raw_attrs': ...,
                            'parse_branch': str,
                            'J_full_info': {...},
                            'suspicious_zero': bool,
@@ -911,43 +918,71 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     import numpy as np
 
     natm = mf_cpu.mol.natm
-    symbols = [atom[0] for atom in mf_cpu.mol._atom]  # ["C","H","H",...]
+    symbols = [atom[0] for atom in mf_cpu.mol._atom]  # ["C", "H", "H", ...]
 
     # ---- 1. Build SSC driver --------------------------------------------
     ssc_driver = _pick_ssc_driver(mf_cpu)
 
-    # We'll run .kernel() twice at most:
-    #   pass 1 (high-verbosity) to get the printed Hz table
-    #   if parsing fails, we can reuse the same 'raw' result rather
-    # We do this in a redirected-stdout block.
+    # We'll need to run ssc_driver.kernel() while:
+    #   - forcing verbosity so PySCF prints the Hz table
+    #   - capturing that print (PySCF writes to obj.stdout, not always sys.stdout)
+    # We'll restore original settings afterward.
 
-    buf = io.StringIO()
     orig_verbose = getattr(ssc_driver, "verbose", None)
+    orig_stdout = getattr(ssc_driver, "stdout", None)
 
-    # bump verbosity so PySCF prints the J table ("Spin-spin coupling constant J (Hz)")
-    if orig_verbose is not None:
+    tmp_buf_driver = io.StringIO()   # we'll try to attach this to ssc_driver.stdout
+    tmp_buf_redirect = io.StringIO() # fallback capture of sys.stdout if needed
+
+    def _run_kernel_and_capture():
+        """
+        Run SpinSpinCoupling.kernel() with elevated verbosity and
+        captured stdout. Return (raw, captured_text).
+        """
+        # Raise verbosity high enough to trigger the pretty J(Hz) print.
         try:
-            ssc_driver.verbose = max(int(orig_verbose), 4)
+            if orig_verbose is not None:
+                ssc_driver.verbose = max(int(orig_verbose), 4)
+            else:
+                ssc_driver.verbose = 4
         except Exception:
-            # non-fatal; just try
-            pass
-    else:
-        # many PySCF objects accept .verbose even if not present in __dict__ yet
-        try:
-            ssc_driver.verbose = 4
-        except Exception:
+            # non-fatal: leave as-is
             pass
 
-    with contextlib.redirect_stdout(buf):
-        raw = ssc_driver.kernel()
-    ssc_text = buf.getvalue()
+        captured_text = ""
 
-    # restore original verbosity
-    if orig_verbose is not None:
         try:
-            ssc_driver.verbose = orig_verbose
+            # Try to override the driver's .stdout to our own buffer.
+            # Many PySCF property objects honor .stdout.
+            ssc_driver.stdout = tmp_buf_driver
+            # In this path, kernel() will (usually) write to tmp_buf_driver,
+            # not to sys.stdout, so no need for redirect_stdout.
+            raw_local = ssc_driver.kernel()
+            captured_text = tmp_buf_driver.getvalue()
+
         except Exception:
-            pass
+            # If that didn't work, fall back to redirect_stdout() to at
+            # least catch whatever lands on sys.stdout.
+            with contextlib.redirect_stdout(tmp_buf_redirect):
+                raw_local = ssc_driver.kernel()
+            captured_text = tmp_buf_redirect.getvalue()
+
+        return (raw_local, captured_text)
+
+    try:
+        (raw, ssc_text) = _run_kernel_and_capture()
+    finally:
+        # Restore original driver settings
+        if orig_verbose is not None:
+            try:
+                ssc_driver.verbose = orig_verbose
+            except Exception:
+                pass
+        if orig_stdout is not None:
+            try:
+                ssc_driver.stdout = orig_stdout
+            except Exception:
+                pass
 
     # ---- 2. Diagnostics setup -------------------------------------------
     diag: Dict[str, object] = {}
@@ -966,13 +1001,14 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     if isinstance(raw, np.ndarray):
         diag["raw_ndarray_info"] = _nd_summary(raw)
     else:
-        raw_attrs = [a for a in dir(raw) if not a.startswith("_")]
-        diag["raw_attrs"] = raw_attrs
+        diag["raw_attrs"] = [
+            a for a in dir(raw) if not a.startswith("_")
+        ]
 
     driver_attrs = [a for a in dir(ssc_driver) if not a.startswith("_")]
     diag["driver_attrs"] = driver_attrs
 
-    # Emit preview of printed table for debugging
+    # Emit preview of printed table for debugging (first ~30 lines)
     _preview_lines = "\n".join(ssc_text.splitlines()[:30])
     LOG.debug(
         "[_build_J_matrix_Hz] SSC stdout preview (truncated):\n%s\n[/preview]",
@@ -982,20 +1018,20 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     # ---- 3. Strategy A: parse printed Hz table --------------------------
     def _parse_J_table(stdout_text, natm):
         """
-        Old-style / verbose-mode PySCF pretty print looks like:
+        Parse a block like:
 
         Spin-spin coupling constant J (Hz)
                        #0        #1
                 0 H    0.00000
-                1 F  413.92070   0.00000
+                1 H  267.47280   0.00000
 
-        We'll try to parse that into a full (natm,natm) float matrix in Hz.
+        into a full (natm,natm) float matrix (Hz).
         Return (Jmat, ok, branch_note).
         """
         Jmat = np.zeros((natm, natm), dtype=float)
         lines = stdout_text.splitlines()
 
-        # find the line with "Spin-spin coupling constant" and "(Hz"
+        # Find header line containing "Spin-spin coupling constant" and "(Hz"
         start_idx = None
         for (li, line) in enumerate(lines):
             if "Spin-spin coupling constant" in line and "(Hz" in line:
@@ -1004,6 +1040,8 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
         if start_idx is None:
             return (Jmat, False, "no_table_header")
 
+        # After that header, PySCF may print one "    #0   #1 ..." line,
+        # then the numeric rows.
         candidate_starts = (start_idx, start_idx + 1, start_idx + 2)
         parsed_any_numeric = False
 
@@ -1018,23 +1056,25 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
             for line in lines[cand_start:]:
                 ls = line.strip()
                 if not ls:
-                    break
-                parts = ls.split()
-                if len(parts) < 2:
+                    # blank -> table ended
                     break
 
-                # first token should be a row index (int), e.g. "0", "1", ...
-                # sometimes PySCF prints those aligned with spaces
+                parts = ls.split()
+                if len(parts) < 2:
+                    # not a data row
+                    break
+
+                # first token should be row index (int)
+                # e.g. "0", "1", maybe aligned/spaced.
                 try:
                     row_i = int(parts[0])
                 except ValueError:
-                    # if it's not an int, table probably ended
+                    # if it's not parseable as int, table probably ended
                     break
 
-                # parts[1] is element label ("H","F",...), we don't strictly need it
+                # parts[1] is the element label ("H", "F", ...)
                 float_tokens = parts[2:] if len(parts) > 2 else []
 
-                # parse floats on this row
                 vals: List[float] = []
                 for tok in float_tokens:
                     try:
@@ -1042,12 +1082,10 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
                     except ValueError:
                         vals.append(np.nan)
 
-                # fill row row_i
                 for j, v in enumerate(vals):
                     if j < natm and np.isfinite(v):
                         tmp_J[row_i, j] = v
                         tmp_numeric = True
-
                 tmp_rows += 1
 
             if tmp_numeric and tmp_rows > 0:
@@ -1058,7 +1096,7 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
         if not parsed_any_numeric:
             return (Jmat, False, "table_parse_failed")
 
-        # symmetrize
+        # enforce symmetry
         Jmat = 0.5 * (Jmat + Jmat.T)
         return (Jmat, True, "table_ok")
 
@@ -1067,12 +1105,13 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
         diag["parse_branch"] = branch_note
         diag["J_full_info"] = _nd_summary(J_full)
         LOG.debug(
-            "[_build_J_matrix_Hz] Parsed J from stdout table (%s). max|J|=%.6f Hz",
+            "[_build_J_matrix_Hz] Parsed J from captured stdout table (%s). "
+            "max|J|=%.6f Hz",
             branch_note,
             diag["J_full_info"]["max_abs"],
         )
 
-    # ---- 4. Strategy B: fall back to raw --------------------------------
+    # ---- 4. Strategy B: fallback to raw if needed -----------------------
     if not ok_table:
         LOG.debug(
             "[_build_J_matrix_Hz] No usable stdout table (%s). "
