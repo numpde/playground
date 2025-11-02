@@ -189,12 +189,12 @@ def main() -> None:
         ("off" if eps is None else f"ddCOSMO eps={eps:.2f}"),
     )
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Robust SSC/J preflight.
     # If this fails:
-    #   --require-j → abort (so we don't waste hours)
-    #   otherwise   → continue with j_ok=False, we'll skip J later.
-    # -------------------------------------------------------------------------
+    #   --require-j → abort before heavy work
+    #   otherwise   → run without J
+    # ------------------------------------------------------------------
     try:
         assert_ssc_available_fast(
             xc=args.xc,
@@ -246,8 +246,13 @@ def main() -> None:
 
             LOG.info("  [cluster %s] %s", row.cid, row.rep_pdb.name)
 
-            # 1. Single SCF → σ_iso and (optionally) J
-            (sigma_iso, J_Hz, kept_labels) = compute_sigma_and_J_once(
+            # --- SINGLE HEAVY CALL ---
+            (
+                sigma_iso,
+                J_Hz,
+                kept_labels,
+                e_tot,
+            ) = compute_sigma_J_and_energy_once(
                 symbols=symbols,
                 coords_A=coords_A,
                 charge=charge,
@@ -257,11 +262,11 @@ def main() -> None:
                 use_gpu=use_gpu,
                 isotopes_keep=args.keep_isotopes,
                 need_J=j_ok,
+                eps=eps,
             )
 
-            # 2. σ_iso → δ(ppm), then write per-cluster shifts
+            # σ_iso → δ(ppm) and write per-cluster shifts
             delta_ppm = sigma_to_delta(symbols, sigma_iso, ref_sigma)
-
             write_cluster_shifts(
                 OUT_DIR,
                 tag,
@@ -272,7 +277,7 @@ def main() -> None:
                 delta_ppm,
             )
 
-            # 3. Write J couplings only if j_ok and we actually have any
+            # Write J couplings only if j_ok and we actually have any
             if j_ok and J_Hz.size:
                 write_j_couplings(
                     OUT_DIR,
@@ -296,20 +301,10 @@ def main() -> None:
                     row.cid,
                 )
 
-            # 4. ddCOSMO (or vacuum) single-point energy in Hartree
-            e_pcm = sp_energy_pcm(
-                symbols,
-                coords_A,
-                charge,
-                spin,
-                args.xc,
-                args.basis,
-                eps,
-                use_gpu=use_gpu,
-            )
-            energies_Ha.append(float(e_pcm))
+            # record energy (already PCM if eps != None)
+            energies_Ha.append(float(e_tot))
 
-        # 5. Write energies_<solvent_key>.tsv
+        # Write energies_<solvent_key>.tsv
         energies_path = OUT_DIR / tag / f"energies_{solvent_key}.tsv"
         energies_path.parent.mkdir(parents=True, exist_ok=True)
         with energies_path.open("w") as fh:
@@ -317,7 +312,7 @@ def main() -> None:
             for (r, E) in zip(table, energies_Ha):
                 fh.write(f"{r.cid}\t{E:.12f}\n")
 
-        # 6. Write metadata
+        # Write metadata
         meta = {
             "xc": args.xc,
             "basis": args.basis,
@@ -330,7 +325,8 @@ def main() -> None:
             "notes": (
                 "Per-cluster shieldings σ_iso and δ(ppm), scalar J couplings "
                 "(Hz, if ssc_available=1), and ddCOSMO single-point "
-                "energies (Hartree) for Boltzmann weighting."
+                "energies (Hartree) for Boltzmann weighting. "
+                "All from ONE SCF per cluster."
             ),
         }
         if first_labels is not None:
