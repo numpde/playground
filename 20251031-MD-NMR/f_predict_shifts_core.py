@@ -884,37 +884,27 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     """
     Build scalar J-coupling matrix (Hz) for the nuclei in `isotopes_keep`.
 
-    Diagnostics:
-    - Capture and DEBUG-log SSC stdout (PySCF prettyprint). Even if empty.
-    - Inspect the raw return from SpinSpinCoupling.kernel():
-        * type, shape, dtype, min/max
-        * dir(raw) if it's not a plain ndarray
-        * also dir(ssc_driver) to see available attributes
-    - Try multiple extraction strategies (printed table, raw ndarray,
-      tensor dicts/arrays, attributes like .iso / .J).
-      NEW: if kernel() returns per-pair 3×3 tensors, try to map them
-      using ssc_driver.nuc_pair (if present) instead of assuming a
-      strict triangular order.
-    - After building J_full, report max|J|.
-      If max|J| < 1e-3 Hz we flag it as "suspiciously zero".
+    Key change:
+    We now *temporarily raise* the SpinSpinCoupling driver's verbosity before
+    calling .kernel(), so PySCF will actually print the human-readable
+    "Spin-spin coupling constant J (Hz)" table even if mf_cpu was created
+    with verbose=0. We capture that stdout and parse it first.
 
-    Return
-    ------
+    Diagnostics are returned so the caller can decide to abort if J looks bad.
+
+    Returns
+    -------
     (J_sel, keep_labels, diag)
-        J_sel         np.ndarray (M,M) in Hz between selected nuclei
-        keep_labels   list[str]   ["H4","H5",...]
+        J_sel         np.ndarray (M,M), Hz
+        keep_labels   list[str]  ["H4","H5",...]
         diag          dict {
                            'raw_type': str(...),
-                           'raw_shape': ...,
-                           'raw_max_abs': float,
-                           'suspicious_zero': bool,
-                           'parse_branch': str,
+                           'raw_ndarray_info' or 'raw_attrs': ...,
                            'driver_attrs': [...],
-                           'raw_attrs': [...],
+                           'parse_branch': str,
+                           'J_full_info': {...},
+                           'suspicious_zero': bool,
                        }
-
-    Caller can decide what to do if diag['suspicious_zero'] is True
-    (e.g. abort if --require-j).
     """
     import io
     import contextlib
@@ -923,26 +913,46 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     natm = mf_cpu.mol.natm
     symbols = [atom[0] for atom in mf_cpu.mol._atom]  # ["C","H","H",...]
 
-    # ---- 1. Run SSC and capture stdout ---------------------------------
+    # ---- 1. Build SSC driver --------------------------------------------
     ssc_driver = _pick_ssc_driver(mf_cpu)
 
+    # We'll run .kernel() twice at most:
+    #   pass 1 (high-verbosity) to get the printed Hz table
+    #   if parsing fails, we can reuse the same 'raw' result rather
+    # We do this in a redirected-stdout block.
+
     buf = io.StringIO()
+    orig_verbose = getattr(ssc_driver, "verbose", None)
+
+    # bump verbosity so PySCF prints the J table ("Spin-spin coupling constant J (Hz)")
+    if orig_verbose is not None:
+        try:
+            ssc_driver.verbose = max(int(orig_verbose), 4)
+        except Exception:
+            # non-fatal; just try
+            pass
+    else:
+        # many PySCF objects accept .verbose even if not present in __dict__ yet
+        try:
+            ssc_driver.verbose = 4
+        except Exception:
+            pass
+
     with contextlib.redirect_stdout(buf):
         raw = ssc_driver.kernel()
     ssc_text = buf.getvalue()
 
-    # Preview first ~30 lines (can be empty)
-    _preview_lines = "\n".join(ssc_text.splitlines()[:30])
-    LOG.debug(
-        "[_build_J_matrix_Hz] SSC stdout preview (truncated):\n%s\n[/preview]",
-        _preview_lines,
-    )
+    # restore original verbosity
+    if orig_verbose is not None:
+        try:
+            ssc_driver.verbose = orig_verbose
+        except Exception:
+            pass
 
-    # Diagnostics dict
+    # ---- 2. Diagnostics setup -------------------------------------------
     diag: Dict[str, object] = {}
     diag["raw_type"] = str(type(raw))
 
-    # Helper to summarize ndarray-ish values
     def _nd_summary(arr):
         arr_np = np.asarray(arr, dtype=float)
         return {
@@ -956,29 +966,36 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     if isinstance(raw, np.ndarray):
         diag["raw_ndarray_info"] = _nd_summary(raw)
     else:
-        # raw can be some custom PySCF result class
         raw_attrs = [a for a in dir(raw) if not a.startswith("_")]
         diag["raw_attrs"] = raw_attrs
 
-    # also introspect the driver
     driver_attrs = [a for a in dir(ssc_driver) if not a.startswith("_")]
     diag["driver_attrs"] = driver_attrs
 
-    # ---- 2. Strategy A: parse human-readable table from stdout ----------
+    # Emit preview of printed table for debugging
+    _preview_lines = "\n".join(ssc_text.splitlines()[:30])
+    LOG.debug(
+        "[_build_J_matrix_Hz] SSC stdout preview (truncated):\n%s\n[/preview]",
+        _preview_lines,
+    )
+
+    # ---- 3. Strategy A: parse printed Hz table --------------------------
     def _parse_J_table(stdout_text, natm):
         """
-        Attempt old-style PySCF pretty print:
+        Old-style / verbose-mode PySCF pretty print looks like:
 
         Spin-spin coupling constant J (Hz)
-        #   0    1    2 ...
-        0 H 0.000 7.123 ...
-        1 H 7.123 0.000 ...
+                       #0        #1
+                0 H    0.00000
+                1 F  413.92070   0.00000
 
-        Return (Jmat, ok, branch_note)
+        We'll try to parse that into a full (natm,natm) float matrix in Hz.
+        Return (Jmat, ok, branch_note).
         """
         Jmat = np.zeros((natm, natm), dtype=float)
         lines = stdout_text.splitlines()
 
+        # find the line with "Spin-spin coupling constant" and "(Hz"
         start_idx = None
         for (li, line) in enumerate(lines):
             if "Spin-spin coupling constant" in line and "(Hz" in line:
@@ -987,10 +1004,9 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
         if start_idx is None:
             return (Jmat, False, "no_table_header")
 
-        # We don't know how many header rows follow, try offsets
         candidate_starts = (start_idx, start_idx + 1, start_idx + 2)
-
         parsed_any_numeric = False
+
         for cand_start in candidate_starts:
             if cand_start >= len(lines):
                 continue
@@ -1004,25 +1020,34 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
                 if not ls:
                     break
                 parts = ls.split()
-                if len(parts) < 3:
+                if len(parts) < 2:
                     break
+
+                # first token should be a row index (int), e.g. "0", "1", ...
+                # sometimes PySCF prints those aligned with spaces
                 try:
                     row_i = int(parts[0])
                 except ValueError:
+                    # if it's not an int, table probably ended
                     break
 
-                # parts[1] is element symbol like H,C,... (string)
-                floats = []
-                for tok in parts[2:]:
-                    try:
-                        floats.append(float(tok))
-                    except ValueError:
-                        floats.append(np.nan)
+                # parts[1] is element label ("H","F",...), we don't strictly need it
+                float_tokens = parts[2:] if len(parts) > 2 else []
 
-                for j, v in enumerate(floats):
+                # parse floats on this row
+                vals: List[float] = []
+                for tok in float_tokens:
+                    try:
+                        vals.append(float(tok))
+                    except ValueError:
+                        vals.append(np.nan)
+
+                # fill row row_i
+                for j, v in enumerate(vals):
                     if j < natm and np.isfinite(v):
                         tmp_J[row_i, j] = v
                         tmp_numeric = True
+
                 tmp_rows += 1
 
             if tmp_numeric and tmp_rows > 0:
@@ -1033,7 +1058,7 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
         if not parsed_any_numeric:
             return (Jmat, False, "table_parse_failed")
 
-        # enforce symmetry
+        # symmetrize
         Jmat = 0.5 * (Jmat + Jmat.T)
         return (Jmat, True, "table_ok")
 
@@ -1047,7 +1072,7 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
             diag["J_full_info"]["max_abs"],
         )
 
-    # ---- 3. Strategy B: interpret raw kernel() return -------------------
+    # ---- 4. Strategy B: fall back to raw --------------------------------
     if not ok_table:
         LOG.debug(
             "[_build_J_matrix_Hz] No usable stdout table (%s). "
@@ -1090,34 +1115,23 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
             branch = "raw_pair_tensors"
             pairs_attr = getattr(ssc_driver, "nuc_pair", None)
 
-            if pairs_attr is not None:
-                # Expect len(nuc_pair) == raw.shape[0], each entry ~ (ia, ja)
-                if len(pairs_attr) == raw.shape[0]:
-                    LOG.debug(
-                        "[_build_J_matrix_Hz] Using ssc_driver.nuc_pair "
-                        "to map pair tensors."
-                    )
-                    for k, pair in enumerate(pairs_attr):
-                        try:
-                            ia = int(pair[0])
-                            ja = int(pair[1])
-                        except Exception:
-                            continue
-                        Jij_iso = _iso_from_tensor(raw[k])
-                        J_full[ia, ja] = Jij_iso
-                        J_full[ja, ia] = Jij_iso
-                    branch = "raw_pair_tensors_nuc_pair"
-                else:
-                    LOG.debug(
-                        "[_build_J_matrix_Hz] len(nuc_pair)=%d "
-                        "!= raw.shape[0]=%d; falling back to "
-                        "triangular enumeration.",
-                        len(pairs_attr),
-                        raw.shape[0],
-                    )
-
-            if branch == "raw_pair_tensors":
-                # fallback: assume strictly upper-triangular enumeration
+            if pairs_attr is not None and len(pairs_attr) == raw.shape[0]:
+                LOG.debug(
+                    "[_build_J_matrix_Hz] Using ssc_driver.nuc_pair "
+                    "to map pair tensors."
+                )
+                for k, pair in enumerate(pairs_attr):
+                    try:
+                        ia = int(pair[0])
+                        ja = int(pair[1])
+                    except Exception:
+                        continue
+                    Jij_iso = _iso_from_tensor(raw[k])
+                    J_full[ia, ja] = Jij_iso
+                    J_full[ja, ia] = Jij_iso
+                branch = "raw_pair_tensors_nuc_pair"
+            else:
+                # fallback assume strict upper triangle ordering
                 n_pairs_expected = natm * (natm - 1) // 2
                 if raw.shape[0] != n_pairs_expected:
                     raise RuntimeError(
@@ -1125,13 +1139,13 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
                         "for natm=%d."
                         % (raw.shape, n_pairs_expected, natm)
                     )
-                k = 0
+                idx = 0
                 for i in range(natm):
                     for j in range(i + 1, natm):
-                        Jij_iso = _iso_from_tensor(raw[k])
+                        Jij_iso = _iso_from_tensor(raw[idx])
                         J_full[i, j] = Jij_iso
                         J_full[j, i] = Jij_iso
-                        k += 1
+                        idx += 1
 
         # Case 3: dict {(ia,ja): tensor}
         elif isinstance(raw, dict):
@@ -1141,16 +1155,9 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
                 J_full[ia, ja] = Jij_iso
                 J_full[ja, ia] = Jij_iso
 
-        # Case 4: object with attrs like .iso, .J, .j_hz, etc.
+        # Case 4: object attrs
         else:
-            candidate_attrs = [
-                "iso",
-                "J",
-                "j_hz",
-                "j_ha",
-                "j_au",
-                "j_matrix",
-            ]
+            candidate_attrs = ["iso", "J", "j_hz", "j_ha", "j_au", "j_matrix"]
             for cand in candidate_attrs:
                 if hasattr(raw, cand):
                     arr = np.asarray(getattr(raw, cand))
@@ -1160,7 +1167,6 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
                         break
 
             if branch == "raw_unknown":
-                # last-resort: maybe the driver keeps it
                 for cand in candidate_attrs:
                     if hasattr(ssc_driver, cand):
                         arr = np.asarray(getattr(ssc_driver, cand))
@@ -1178,8 +1184,7 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
             diag["J_full_info"]["max_abs"],
         )
 
-    # ---- 4. Units / sanity -----------------------------------------------
-    # Assume Hz. If everything is ~0 Hz, scream.
+    # ---- 5. sanity -------------------------------------------------------
     suspicious_zero = (diag["J_full_info"]["max_abs"] < 1e-3)
     diag["suspicious_zero"] = bool(suspicious_zero)
     if suspicious_zero:
@@ -1192,7 +1197,7 @@ def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
             diag.get("driver_attrs", []),
         )
 
-    # ---- 5. Subselect isotopes -------------------------------------------
+    # ---- 6. isotope subselect -------------------------------------------
     iso_map = {
         "H": "1H",
         "C": "13C",
