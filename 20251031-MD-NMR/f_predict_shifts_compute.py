@@ -63,15 +63,13 @@ from f_predict_shifts_core import (
     get_charge_spin,
     load_clusters_table,
     read_pdb_atoms,
-    compute_sigma_iso,
-    compute_spinspin_JHz,
     sigma_to_delta,
     sp_energy_pcm,
     tms_ref_sigma,
     write_cluster_shifts,
     write_j_couplings,
     write_params,
-    assert_ssc_available_fast,
+    assert_ssc_available_fast, compute_sigma_and_J_once,
 )
 
 LOG = logging.getLogger("nmrshifts.compute")
