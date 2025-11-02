@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -546,58 +545,103 @@ def sigma_to_delta(
 
 def _tms_guess_geometry() -> Tuple[List[str], np.ndarray]:
     """
-    Initial TMS (Si(CH3)4) guess in Cartesian Å.
-    This is *not* guaranteed optimized. We'll refine it before use.
+    Build an idealized Td TMS (Si(CH3)4) geometry in Cartesian Å.
+
+    - Si at the origin.
+    - 4 carbons along perfect tetrahedral directions (±1,±1,±1 normalized)
+      at distance R_SiC.
+    - For each carbon, place 3 hydrogens in perfect tetrahedral geometry
+      around that carbon, assuming Si is the 4th substituent.
+
+    The CH3 geometry is constructed analytically:
+    - Let the C–Si bond define the local +z axis (pointing from C to Si).
+    - In a perfect sp3 tetrahedron, the angle between any two bonds is
+      arccos(-1/3) ≈ 109.47°. That means each C–H bond direction has
+      cos(theta) = -1/3 relative to +z, and radial component in the
+      perpendicular plane of magnitude sin(theta) = 2*sqrt(2)/3.
+
+    By generating the 3 hydrogens at azimuths 0°, 120°, 240° in that
+    local frame, and then rotating that frame so +z maps onto the actual
+    C→Si direction, all four methyl groups are strictly equivalent.
     """
+
+    import numpy as np
+    import math
+
     syms: List[str] = []
-    coords: List[Tuple[float, float, float]] = []
+    coords: List[np.ndarray] = []
 
-    def add(a, x, y, z):
-        syms.append(a)
-        coords.append((x, y, z))
+    # Distances (Å). These do not need to be extremely accurate;
+    # what's critical is *symmetry*, not exact bond length.
+    R_SiC = 1.86  # Si–C bond length guess
+    R_CH = 1.09  # C–H bond length guess
 
-    add("Si", 0.0, 0.0, 0.0)
-    R_SiC, R_CH = 1.86, 1.09
-    dirs = [(1, 1, 1), (-1, -1, 1), (-1, 1, -1), (1, -1, -1)]
+    # Put Si at origin
+    syms.append("Si")
+    coords.append(np.zeros(3, dtype=float))
 
-    for (dx, dy, dz) in dirs:
-        n = (dx * dx + dy * dy + dz * dz) ** 0.5
-        (ux, uy, uz) = (dx / n, dy / n, dz / n)
-        (cx, cy, cz) = (R_SiC * ux, R_SiC * uy, R_SiC * uz)
-        add("C", cx, cy, cz)
+    # Ideal tetrahedral directions for Si–C bonds
+    dirs = np.array([
+        [1.0, 1.0, 1.0],
+        [-1.0, -1.0, 1.0],
+        [-1.0, 1.0, -1.0],
+        [1.0, -1.0, -1.0],
+    ], dtype=float)
+    dirs /= np.linalg.norm(dirs, axis=1)[:, None]  # normalize each
 
-        (ax, ay, az) = (-ux, -uy, -uz)
-        if abs(ax) < 0.9:
-            (px, py, pz) = (1.0, 0.0, 0.0)
-        else:
-            (px, py, pz) = (0.0, 1.0, 0.0)
+    # Precompute local tetrahedral CH3 geometry in a canonical frame:
+    # local frame: C at origin, Si on +z, hydrogens at 109.47° from +z
+    cos_theta = -1.0 / 3.0
+    sin_theta = (2.0 * math.sqrt(2.0)) / 3.0  # = sqrt(1 - cos^2)
 
-        vx, vy, vz = (
-            px - (ax * px + ay * py + az * pz) * ax,
-            py - (ax * px + ay * py + az * pz) * ay,
-            pz - (ax * px + ay * py + az * pz) * az,
-        )
-        vn = (vx * vx + vy * vy + vz * vz) ** 0.5
-        vx, vy, vz = vx / vn, vy / vn, vz / vn
-        wx, wy, wz = (
-            ay * vz - az * vy,
-            az * vx - ax * vz,
-            ax * vy - ay * vx,
-        )
+    # unit vectors for the 3 H positions in the canonical frame
+    # azimuth 0°, 120°, 240°
+    def canonical_CH_dirs():
+        out = []
+        for phi_deg in (0.0, 120.0, 240.0):
+            phi = math.radians(phi_deg)
+            # vector in canonical coords (C at 0, Si along +z)
+            vx = sin_theta * math.cos(phi)
+            vy = sin_theta * math.sin(phi)
+            vz = cos_theta
+            out.append(np.array([vx, vy, vz], dtype=float))
+        return out
 
-        for ang in (0.0, 2.0943951023931953, 4.1887902047863905):
-            hx = cx + R_CH * (
-                    0.6 * ax + 0.8 * (math.cos(ang) * vx + math.sin(ang) * wx)
-            )
-            hy = cy + R_CH * (
-                    0.6 * ay + 0.8 * (math.cos(ang) * vy + math.sin(ang) * wy)
-            )
-            hz = cz + R_CH * (
-                    0.6 * az + 0.8 * (math.cos(ang) * vz + math.sin(ang) * wz)
-            )
-            add("H", hx, hy, hz)
+    CH_local_dirs = canonical_CH_dirs()
 
-    return syms, np.array(coords, float)
+    for u in dirs:
+        # Carbon position relative to Si
+        c_pos = R_SiC * u
+        syms.append("C")
+        coords.append(c_pos)
+
+        # Build a local frame for this methyl:
+        # We want the local +z axis to point from C toward Si.
+        # axis = (Si - C) normalized = (-u) because Si is at origin.
+        axis = (-u).copy()
+        axis /= np.linalg.norm(axis)
+
+        # Pick a helper vector not parallel to axis for frame construction
+        helper = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(np.dot(helper, axis)) > 0.9:
+            helper = np.array([1.0, 0.0, 0.0], dtype=float)
+
+        # Orthonormal basis: e3 = axis, e1 ⟂ axis, e2 = e3 × e1
+        e3 = axis
+        e1 = np.cross(e3, helper)
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(e3, e1)
+
+        # Now place the 3 hydrogens
+        for d_loc in CH_local_dirs:
+            # d_loc is expressed in canonical frame where +z is C→Si.
+            # Map it into world coords: d_world = d_loc_x * e1 + d_loc_y * e2 + d_loc_z * e3
+            d_world = d_loc[0] * e1 + d_loc[1] * e2 + d_loc[2] * e3
+            h_pos = c_pos + R_CH * d_world
+            syms.append("H")
+            coords.append(h_pos)
+
+    return (syms, np.array(coords, dtype=float))
 
 
 def _optimize_geometry_cpu(
