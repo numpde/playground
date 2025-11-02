@@ -775,146 +775,246 @@ def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
 
 def _pick_ssc_driver(mf_cpu):
     """
-    Return an SSC driver bound to the mean-field.
-    PySCF exposes SSC as backend-specific classes:
-    pyscf.prop.ssc.rks.SSC / rhf.SSC / uks.SSC / uhf.SSC.
+    Return a PySCF spin–spin coupling driver bound to ``mf_cpu`` that can
+    actually report physical J couplings in Hz.
+
+    Strategy:
+    - Prefer the high-level ``SpinSpinCoupling`` class (it computes and
+      prints "Spin-spin coupling constant J (Hz)").
+    - Fall back to the lower-level ``SSC`` class if ``SpinSpinCoupling``
+      is missing for that backend.
+
+    We branch on the MF type (RHF/RKS/UHF/UKS) so PySCF picks the right
+    response theory.
+
+    This replaces the older version that always returned ``SSC``.
+    That older path only exposed the reduced K tensors and led to
+    ~0 Hz downstream.
     """
-    from pyscf.prop import ssc as ssc_mod  # type: ignore
+    # imports inside the function so module import doesn't hard-require PySCF at import time
+    from pyscf import scf, dft
+    from pyscf.prop import ssc as ssc_mod
+
+    def _backend_driver(backend_mod, mf_for_backend):
+        """
+        Given a backend module like ssc_mod.rks or ssc_mod.rhf and
+        the matching mean-field object, try SpinSpinCoupling first,
+        then SSC.
+        """
+        if hasattr(backend_mod, "SpinSpinCoupling"):
+            return backend_mod.SpinSpinCoupling(mf_for_backend)
+        if hasattr(backend_mod, "SSC"):
+            return backend_mod.SSC(mf_for_backend)
+        return None
+
+    drv = None
 
     # Restricted HF
     if isinstance(mf_cpu, scf.hf.RHF):
-        from pyscf.prop.ssc import rhf as _b  # type: ignore
-
-        return _b.SSC(mf_cpu)
+        if hasattr(ssc_mod, "rhf"):
+            drv = _backend_driver(ssc_mod.rhf, mf_cpu)
 
     # Restricted KS-DFT
-    if isinstance(mf_cpu, dft.rks.RKS):
-        try:
-            from pyscf.prop.ssc import rks as _b  # type: ignore
+    elif isinstance(mf_cpu, dft.rks.RKS):
+        if hasattr(ssc_mod, "rks"):
+            drv = _backend_driver(ssc_mod.rks, mf_cpu)
 
-            return _b.SSC(mf_cpu)
-        except Exception:
-            LOG.warning("No RKS SSC; retrying via RHF fallback.")
+        # If RKS backend missing, degrade politely to RHF on the same geometry.
+        if drv is None and hasattr(ssc_mod, "rhf"):
+            LOG.warning("No RKS SpinSpinCoupling/SSC; retrying via RHF fallback.")
             rhf_mf = scf.RHF(mf_cpu.mol).run()
-            from pyscf.prop.ssc import rhf as _b2  # type: ignore
-
-            return _b2.SSC(rhf_mf)
+            drv = _backend_driver(ssc_mod.rhf, rhf_mf)
 
     # Unrestricted HF
-    if isinstance(mf_cpu, scf.uhf.UHF):
-        from pyscf.prop.ssc import uhf as _b  # type: ignore
-
-        return _b.SSC(mf_cpu)
+    elif isinstance(mf_cpu, scf.uhf.UHF):
+        if hasattr(ssc_mod, "uhf"):
+            drv = _backend_driver(ssc_mod.uhf, mf_cpu)
 
     # Unrestricted KS-DFT
-    if isinstance(mf_cpu, dft.uks.UKS):
-        try:
-            from pyscf.prop.ssc import uks as _b  # type: ignore
+    elif isinstance(mf_cpu, dft.uks.UKS):
+        if hasattr(ssc_mod, "uks"):
+            drv = _backend_driver(ssc_mod.uks, mf_cpu)
 
-            return _b.SSC(mf_cpu)
-        except Exception:
-            LOG.warning("No UKS SSC; retrying via UHF fallback.")
+        # If UKS backend missing, degrade to UHF.
+        if drv is None and hasattr(ssc_mod, "uhf"):
+            LOG.warning("No UKS SpinSpinCoupling/SSC; retrying via UHF fallback.")
             uhf_mf = scf.UHF(mf_cpu.mol).run()
-            from pyscf.prop.ssc import uhf as _b2  # type: ignore
+            drv = _backend_driver(ssc_mod.uhf, uhf_mf)
 
-            return _b2.SSC(uhf_mf)
+    if drv is None:
+        raise RuntimeError(f"Unsupported MF type for SSC: {type(mf_cpu)}")
 
-    raise RuntimeError(f"Unsupported MF type for SSC: {type(mf_cpu)}")
+    return drv
 
 
-def _build_J_matrix_Hz(
-        mf_cpu,
-        isotopes_keep: Sequence[str],
-) -> Tuple[np.ndarray, List[str]]:
+def _build_J_matrix_Hz(mf_cpu, isotopes_keep):
     """
-    Compute an isotropic scalar J-coupling matrix (Hz) from a CPU mean-field.
+    Compute an *isotropic scalar* J–coupling matrix (Hz) for the requested
+    nuclei, from one CPU mean-field.
 
-    We tolerate multiple PySCF SSC output formats:
-      1) ndarray shape (natm, natm)                    ← direct scalar Hz
-      2) ndarray shape (n_pairs, 3, 3)                 ← per-pair 3x3 tensors
-      3) dict[(ia, ja)] = scalar or tensor-like value  ← mixed/legacy
+    What changed:
+    - We now run PySCF's SpinSpinCoupling/SSC ONCE, capture its stdout,
+      and parse the human-readable table
+          "Spin-spin coupling constant J (Hz)"
+      which is where PySCF actually prints the physical J_ij in Hz.
+      Those are the ~7 Hz vicinal 1H–1H, ~130 Hz 1J_CH, ~400+ Hz 1J_HF
+      numbers chemists expect.
 
-    For case (2), we assume pairs are ordered over i<j in the upper triangle.
-    The scalar J_ij is taken as trace(tensor)/3 (Hz).
-
-    The returned matrix is then subset to the requested isotopes.
+    - If parsing that table fails (backend differences etc.), we fall
+      back to the old tensor trace/3 heuristic on the raw return, so we
+      still won't crash.
 
     Returns:
         (J_sel, keep_labels)
-        J_sel      (M,M) symmetric ndarray in Hz
-        keep_labels list[str] nucleus labels matching rows/cols in J_sel
+        J_sel        np.ndarray shape (M,M), symmetric in Hz
+        keep_labels  list[str]   pretty nucleus labels corresponding to rows/cols
     """
-
-    def _iso_from_tensor(val) -> float:
-        """
-        Reduce whatever SSC.kernel() gave us for a pair (ia,ja)
-        to an isotropic scalar J in Hz.
-        """
-        arr = np.asarray(val, dtype=float)
-
-        # scalar already
-        if arr.ndim == 0:
-            return float(arr)
-
-        # full 3x3 tensor → trace/3
-        if arr.ndim == 2 and arr.shape == (3, 3):
-            return float(np.trace(arr) / 3.0)
-
-        # length-3 vector or arbitrary small thing → mean as fallback
-        if arr.ndim == 1 and arr.shape[0] == 3:
-            return float(np.mean(arr))
-
-        # last-resort fallback (robust against PySCF shape drift)
-        return float(np.mean(arr))
-
-    # run SSC on this MF
-    ssc_driver = _pick_ssc_driver(mf_cpu)
-    raw = ssc_driver.kernel()
+    import io
+    import contextlib
+    import numpy as np
 
     natm = mf_cpu.mol.natm
-    J_full = np.zeros((natm, natm), dtype=float)
+    symbols = [atom[0] for atom in mf_cpu.mol._atom]  # e.g. ["C","H","H",...]
 
-    # Format 1: full natm×natm array already in Hz
-    if isinstance(raw, np.ndarray) and raw.ndim == 2:
-        if raw.shape != (natm, natm):
-            raise RuntimeError(
-                f"SSC kernel ndarray shape {raw.shape} "
-                f"!= ({natm},{natm}); don't know how to map."
-            )
-        J_full[:, :] = np.asarray(raw, dtype=float)
+    # ---- 1. Run SSC once, capture stdout ----
+    ssc_driver = _pick_ssc_driver(mf_cpu)
 
-    # Format 2: per-pair anisotropic tensors, e.g. (n_pairs,3,3)
-    elif isinstance(raw, np.ndarray) and raw.ndim == 3 and raw.shape[1:] == (3, 3):
-        n_pairs_expected = natm * (natm - 1) // 2
-        if raw.shape[0] != n_pairs_expected:
-            raise RuntimeError(
-                f"SSC kernel ndarray shape {raw.shape} doesn't match "
-                f"{n_pairs_expected} unique pairs for natm={natm}."
-            )
-        k = 0
-        for i in range(natm):
-            for j in range(i + 1, natm):
-                Jij_iso_Hz = _iso_from_tensor(raw[k])
-                J_full[i, j] = Jij_iso_Hz
-                J_full[j, i] = Jij_iso_Hz
-                k += 1
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        raw = ssc_driver.kernel()
+    ssc_text = buf.getvalue()
 
-    # Format 3: dict[(ia,ja)] = scalar/tensor
-    elif isinstance(raw, dict):
-        for (ia, ja), val in raw.items():
-            Jij_iso_Hz = _iso_from_tensor(val)
-            J_full[ia, ja] = Jij_iso_Hz
-            J_full[ja, ia] = Jij_iso_Hz
+    # ---- 2. Parse "Spin-spin coupling constant J (Hz)" table ----
+    def _parse_J_table(stdout_text, natm):
+        """
+        Returns (J_full, ok)
 
-    else:
-        raise RuntimeError(
-            f"SSC kernel() return type {type(raw)} / shape "
-            f"{getattr(getattr(raw, 'shape', None), '__str__', lambda: '?')()} "
-            "not recognized."
+        J_full : (natm,natm) float64, symmetric
+        ok     : bool, True if we parsed the real J(Hz) table
+        """
+        Jmat = np.zeros((natm, natm), dtype=float)
+        lines = stdout_text.splitlines()
+
+        # Find the block header
+        start_idx = None
+        for (li, line) in enumerate(lines):
+            if "Spin-spin coupling constant J" in line and "(Hz)" in line:
+                # Skip two lines:
+                #   header with '#0 #1 #2 ...'
+                #   then first data row starts
+                start_idx = li + 2
+                break
+
+        if start_idx is None:
+            return (Jmat, False)
+
+        rows_parsed = 0
+        for line in lines[start_idx:]:
+            if not line.strip():
+                break  # blank line = end of table
+
+            # Expected-ish row format, e.g.
+            # "        1 F  413.92070   0.00000"
+            parts = line.strip().split()
+            # parts[0] -> row atom index (int)
+            # parts[1] -> element symbol ("H","C",...)
+            # parts[2:] -> that row's J values against col 0..N-1 in Hz
+            if len(parts) < 3:
+                break
+
+            try:
+                row_i = int(parts[0])
+            except ValueError:
+                break
+
+            val_tokens = parts[2:]
+            vals = []
+            for tok in val_tokens:
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    vals.append(np.nan)
+
+            for j, v in enumerate(vals):
+                if j < natm and np.isfinite(v):
+                    Jmat[row_i, j] = v
+
+            rows_parsed += 1
+
+        if rows_parsed == 0:
+            return (Jmat, False)
+
+        # Symmetrize just in case the printout is upper- or lower-triangular
+        Jmat = 0.5 * (Jmat + Jmat.T)
+        return (Jmat, True)
+
+    (J_full, ok) = _parse_J_table(ssc_text, natm)
+
+    # ---- 3. Fallback: old tensor trace/3 heuristic on raw ----
+    if not ok:
+        LOG.debug(
+            "SSC parse of printed J table failed; "
+            "falling back to tensor trace/3 heuristic."
         )
 
-    # Decide which nuclei to keep (1H-only special case, or explicit isotopes)
-    symbols = [a[0] for a in mf_cpu.mol._atom]
+        def _iso_from_tensor(val):
+            arr = np.asarray(val, dtype=float)
+            if arr.ndim == 2 and arr.shape == (3, 3):
+                # standard isotropic coupling = trace/3
+                return float(np.trace(arr) / 3.0)
+            if arr.ndim == 1 and arr.shape[0] == 3:
+                return float(np.mean(arr))
+            if arr.ndim == 0:
+                return float(arr)
+            return float(np.mean(arr))
+
+        J_full = np.zeros((natm, natm), dtype=float)
+
+        # Case A: raw is an (natm,natm) array already
+        if isinstance(raw, np.ndarray) and raw.ndim == 2:
+            if raw.shape != (natm, natm):
+                raise RuntimeError(
+                    f"SSC kernel ndarray shape {raw.shape} "
+                    f"!= ({natm},{natm}); cannot map."
+                )
+            J_full[:, :] = np.asarray(raw, dtype=float)
+
+        # Case B: raw is (n_pairs,3,3) anisotropic tensors
+        elif (
+                isinstance(raw, np.ndarray)
+                and raw.ndim == 3
+                and raw.shape[1:] == (3, 3)
+        ):
+            n_pairs_expected = natm * (natm - 1) // 2
+            if raw.shape[0] != n_pairs_expected:
+                raise RuntimeError(
+                    "SSC kernel ndarray shape "
+                    f"{raw.shape} doesn't match {n_pairs_expected} pairs "
+                    f"for natm={natm}."
+                )
+            k = 0
+            for i in range(natm):
+                for j in range(i + 1, natm):
+                    Jij_iso_Hz = _iso_from_tensor(raw[k])
+                    J_full[i, j] = Jij_iso_Hz
+                    J_full[j, i] = Jij_iso_Hz
+                    k += 1
+
+        # Case C: raw is a dict {(ia,ja): tensor}
+        elif isinstance(raw, dict):
+            for (ia, ja), tensor_val in raw.items():
+                Jij_iso_Hz = _iso_from_tensor(tensor_val)
+                J_full[ia, ja] = Jij_iso_Hz
+                J_full[ja, ia] = Jij_iso_Hz
+
+        else:
+            raise RuntimeError(
+                f"SSC kernel() return type {type(raw)} not recognized."
+            )
+
+    # ---- 4. Subselect only the requested isotopes and label them ----
+    #   - If isotopes_keep == ['1H'] (or ['h']), keep only hydrogens.
+    #   - Otherwise use typical NMR-active nuclei.
     iso_map = {
         "H": "1H",
         "C": "13C",
@@ -928,8 +1028,8 @@ def _build_J_matrix_Hz(
             and isotopes_keep[0].lower() in ("1h", "h")
     )
 
-    keep_idx: List[int] = []
-    keep_labels: List[str] = []
+    keep_idx = []
+    keep_labels = []
 
     for (i, el) in enumerate(symbols):
         if only_H:
@@ -937,14 +1037,13 @@ def _build_J_matrix_Hz(
                 keep_idx.append(i)
                 keep_labels.append(f"H{i + 1}")
         else:
-            iso_guess = iso_map.get(el.capitalize())
-            if iso_guess in isotopes_keep:
+            guess_iso = iso_map.get(el.capitalize())
+            if guess_iso in isotopes_keep:
                 keep_idx.append(i)
                 keep_labels.append(f"{el}{i + 1}")
 
     if not keep_idx:
-        # Nothing requested (or no matches). Return empty.
-        return np.zeros((0, 0), dtype=float), []
+        return (np.zeros((0, 0), dtype=float), [])
 
     sel = np.array(keep_idx, dtype=int)
     J_sel = J_full[np.ix_(sel, sel)].astype(float)
