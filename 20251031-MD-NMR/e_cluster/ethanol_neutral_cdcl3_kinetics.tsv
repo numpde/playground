@@ -1,0 +1,6 @@
+# approx kinetics summary
+# FRAME_DT_PS=1.0 ps per frame
+# rows: from_cluster, cols: to_cluster, value: jump count
+211	36	45
+37	344	38
+44	39	316

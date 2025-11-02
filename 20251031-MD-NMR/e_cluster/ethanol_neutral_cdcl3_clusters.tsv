@@ -1,0 +1,4 @@
+#cluster_id	count	fraction	medoid_frame_idx	rep_pdb_path
+0	293	0.263726	114	ethanol_neutral_cdcl3_cluster_0_rep.pdb
+1	419	0.377138	708	ethanol_neutral_cdcl3_cluster_1_rep.pdb
+2	399	0.359136	252	ethanol_neutral_cdcl3_cluster_2_rep.pdb
