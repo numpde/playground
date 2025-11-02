@@ -17,7 +17,7 @@
 #   - cluster_<cid>_J.npy                (full J matrix, Hz, np.save format)
 #   - cluster_<cid>_J_labels.txt         (spin labels order matching J.npy)
 #
-# 2025-11-01
+# 2025-11-02 (fail-fast SSC/J check)
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from f_predict_shifts_core import (
     write_cluster_shifts,
     write_j_couplings,
     write_params,
+    assert_ssc_available_fast,
 )
 
 LOG = logging.getLogger("nmrshifts.compute")
@@ -158,6 +159,25 @@ def main() -> None:
         ("off" if eps is None else f"ddCOSMO eps={eps:.2f}"),
     )
 
+    # ---------------------------------------------------------------------
+    # FAIL-FAST CHECK:
+    # Before we do hour-long SCF on big molecules, make sure SSC/J is
+    # actually available in this PySCF build. If not, abort now.
+    # ---------------------------------------------------------------------
+    try:
+        assert_ssc_available_fast(
+            xc=args.xc,
+            basis=args.basis,
+            isotopes_keep=args.keep_isotopes,
+        )
+    except Exception as e:
+        LOG.error(
+            "Spin-spin coupling (SSC/J) not available in this environment: %s",
+            e,
+        )
+        LOG.error("Aborting before heavy SCF.")
+        return
+
     # Tag discovery
     if args.tags:
         tags = args.tags
@@ -173,7 +193,7 @@ def main() -> None:
         LOG.info("[tag] %s", tag)
         table = load_clusters_table(CLUSTERS_DIR / f"{tag}_clusters.tsv", tag)
 
-        # Global charge/spin guess from tag (you can always override later if needed)
+        # Global charge/spin guess from tag
         (charge, spin) = get_charge_spin(tag)
 
         # Reference σ(TMS) so we can convert σ_iso → δ (ppm)
@@ -188,7 +208,7 @@ def main() -> None:
 
             LOG.info("  [cluster %s] %s", row.cid, row.rep_pdb.name)
 
-            # 1. Shieldings σ_iso (gas-phase calc) → shifts δ ppm
+            # 1. Shieldings σ_iso → shifts δ ppm
             sigma_iso = compute_sigma_iso(
                 symbols,
                 coords_A,
@@ -203,7 +223,7 @@ def main() -> None:
                 OUT_DIR, tag, row.cid, atom_names, symbols, sigma_iso, delta_ppm
             )
 
-            # 2. Scalar spin–spin couplings J_ij in Hz (solution-state)
+            # 2. Scalar spin–spin couplings J_ij in Hz
             try:
                 (J_Hz, kept_labels) = compute_spinspin_JHz(
                     symbols,
@@ -217,15 +237,12 @@ def main() -> None:
                 )
 
                 if J_Hz.size:
-                    # write human-readable triangular TSV
+                    # Write human-readable triangular TSV, plus machine artifacts
                     write_j_couplings(OUT_DIR, tag, row.cid, kept_labels, J_Hz)
-                    # write machine-readable .npy plus label order
                     _save_J_aux(OUT_DIR, tag, row.cid, kept_labels, J_Hz)
 
-                    # remember first label order to record in params
                     if first_labels is None:
                         first_labels = list(kept_labels)
-
                 else:
                     LOG.warning(
                         "    [cluster %s] No nuclei kept for J (keep-isotopes=%s).",
@@ -253,7 +270,7 @@ def main() -> None:
             )
             energies_Ha.append(float(e_pcm))
 
-        # 4. Save energies_<solvent_key>.tsv (for weighting / Boltzmann later)
+        # 4. Save energies_<solvent_key>.tsv
         energies_path = OUT_DIR / tag / f"energies_{solvent_key}.tsv"
         with energies_path.open("w") as fh:
             fh.write("# cid\tenergy_Ha\n")
