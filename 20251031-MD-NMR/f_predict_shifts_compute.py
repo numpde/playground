@@ -109,8 +109,10 @@ def parse_cli() -> argparse.Namespace:
         "--eps",
         type=float,
         default=None,
-        help="Override dielectric constant for ddCOSMO. "
-             "If set, overrides --solvent.",
+        help=(
+            "Override dielectric constant for ddCOSMO. "
+            "If set, overrides --solvent."
+        ),
     )
 
     p.add_argument(
@@ -137,6 +139,17 @@ def parse_cli() -> argparse.Namespace:
         "--no-opt",
         action="store_true",
         help="Reserved (geometry opt currently not performed).",
+    )
+
+    p.add_argument(
+        "--tms-opt",
+        action="store_true",
+        help=(
+            "Allow Berny geometry optimization for the TMS reference "
+            "before computing σ_ref. "
+            "By default (flag absent), TMS is NOT optimized; "
+            "a symmetric guess geometry is used."
+        ),
     )
 
     p.add_argument(
@@ -225,6 +238,15 @@ def main() -> None:
             return
         tags = [cf.stem.removesuffix("_clusters") for cf in cfs]
 
+    # TMS reference σ_ref so we can report δ(ppm).
+    # We pass do_opt=... which controls Berny geometry relaxation
+    # of the TMS reference only. Default (False) = skip Berny.
+    ref_sigma = tms_ref_sigma(
+        args.xc,
+        args.basis,
+        do_opt=args.tms_opt,
+    )
+
     # Process each tag
     for tag in tags:
         LOG.info("[tag] %s", tag)
@@ -232,9 +254,6 @@ def main() -> None:
 
         # crude global charge, multiplicity guess from tag name
         (charge, spin) = get_charge_spin(tag)
-
-        # TMS reference σ_ref so we can report δ(ppm)
-        ref_sigma = tms_ref_sigma(args.xc, args.basis)
 
         energies_Ha: List[float] = []
         first_labels: Optional[List[str]] = None
@@ -321,11 +340,14 @@ def main() -> None:
             "solvent_key": solvent_key,
             "keep_isotopes": args.keep_isotopes,
             "ssc_available": int(j_ok),
+            "tms_opt": bool(args.tms_opt),
             "notes": (
                 "Per-cluster shieldings σ_iso and δ(ppm), scalar J couplings "
                 "(Hz, if ssc_available=1), and ddCOSMO single-point "
                 "energies (Hartree) for Boltzmann weighting. "
-                "All from ONE SCF per cluster."
+                "All from ONE SCF per cluster. "
+                "tms_opt=True means Berny optimization was allowed for the "
+                "TMS reference used for δ(ppm)."
             ),
         }
         if first_labels is not None:
