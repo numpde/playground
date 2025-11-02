@@ -193,16 +193,9 @@ def main() -> None:
 
     # -------------------------------------------------------------------------
     # Robust SSC/J preflight.
-    #
-    # We call assert_ssc_available_fast(), which:
-    #   - builds a tiny H2 on CPU
-    #   - runs SCF
-    #   - tries SSC
-    #   - reduces pair tensors → isotropic J (Hz)
-    #   - checks for finite, square result
-    #
-    # If that fails and --require-j is set, we stop NOW (before hours of SCF).
-    # Otherwise we just log and continue with j_ok=False.
+    # If this fails:
+    #   --require-j → abort (so we don't waste hours)
+    #   otherwise   → continue with j_ok=False, we'll skip J later.
     # -------------------------------------------------------------------------
     try:
         assert_ssc_available_fast(
@@ -218,9 +211,7 @@ def main() -> None:
                 "Spin–spin coupling (SSC/J) preflight failed: %s",
                 e,
             )
-            LOG.error(
-                "--require-j was set → aborting before heavy SCF."
-            )
+            LOG.error("--require-j was set → aborting before heavy SCF.")
             return
         LOG.warning(
             "J couplings will be skipped (SSC preflight failed: %s).",
@@ -253,21 +244,24 @@ def main() -> None:
 
         # per-cluster loop
         for row in table:
-            atom_names, symbols, coords_A = read_pdb_atoms(row.rep_pdb)
+            (atom_names, symbols, coords_A) = read_pdb_atoms(row.rep_pdb)
 
             LOG.info("  [cluster %s] %s", row.cid, row.rep_pdb.name)
 
-            # 1. Shielding tensors → σ_iso → chemical shifts δ
-            sigma_iso = compute_sigma_iso(
-                symbols,
-                coords_A,
-                charge,
-                spin,
-                args.xc,
-                args.basis,
+            # 1. Single SCF → σ_iso and (optionally) J
+            (sigma_iso, J_Hz, kept_labels) = compute_sigma_and_J_once(
+                symbols=symbols,
+                coords_A=coords_A,
+                charge=charge,
+                spin=spin,
+                xc=args.xc,
+                basis=args.basis,
                 use_gpu=use_gpu,
+                isotopes_keep=args.keep_isotopes,
+                need_J=j_ok,
             )
 
+            # 2. σ_iso → δ(ppm), then write per-cluster shifts
             delta_ppm = sigma_to_delta(symbols, sigma_iso, ref_sigma)
 
             write_cluster_shifts(
@@ -280,51 +274,31 @@ def main() -> None:
                 delta_ppm,
             )
 
-            # 2. Scalar spin–spin couplings J_ij in Hz (only if j_ok)
-            if j_ok:
-                try:
-                    (J_Hz, kept_labels) = compute_spinspin_JHz(
-                        symbols,
-                        coords_A,
-                        charge,
-                        spin,
-                        args.xc,
-                        args.basis,
-                        use_gpu=use_gpu,
-                        isotopes_keep=args.keep_isotopes,
-                    )
-
-                    if J_Hz.size:
-                        write_j_couplings(
-                            OUT_DIR,
-                            tag,
-                            row.cid,
-                            kept_labels,
-                            J_Hz,
-                        )
-                        if first_labels is None:
-                            first_labels = list(kept_labels)
-                    else:
-                        LOG.warning(
-                            "    [cluster %s] No nuclei kept for J "
-                            "(keep-isotopes=%s).",
-                            row.cid,
-                            args.keep_isotopes,
-                        )
-
-                except Exception as e:
-                    LOG.error(
-                        "    [cluster %s] J coupling computation failed: %s",
-                        row.cid,
-                        e,
-                    )
+            # 3. Write J couplings only if j_ok and we actually have any
+            if j_ok and J_Hz.size:
+                write_j_couplings(
+                    OUT_DIR,
+                    tag,
+                    row.cid,
+                    kept_labels,
+                    J_Hz,
+                )
+                if first_labels is None:
+                    first_labels = list(kept_labels)
+            elif j_ok:
+                LOG.warning(
+                    "    [cluster %s] No nuclei kept for J "
+                    "(keep-isotopes=%s).",
+                    row.cid,
+                    args.keep_isotopes,
+                )
             else:
                 LOG.debug(
                     "    [cluster %s] Skipping J couplings (SSC disabled).",
                     row.cid,
                 )
 
-            # 3. ddCOSMO single-point energy in Hartree
+            # 4. ddCOSMO (or vacuum) single-point energy in Hartree
             e_pcm = sp_energy_pcm(
                 symbols,
                 coords_A,
@@ -337,15 +311,15 @@ def main() -> None:
             )
             energies_Ha.append(float(e_pcm))
 
-        # 4. Write energies_<solvent_key>.tsv
+        # 5. Write energies_<solvent_key>.tsv
         energies_path = OUT_DIR / tag / f"energies_{solvent_key}.tsv"
         energies_path.parent.mkdir(parents=True, exist_ok=True)
         with energies_path.open("w") as fh:
             fh.write("# cid\tenergy_Ha\n")
-            for r, E in zip(table, energies_Ha):
+            for (r, E) in zip(table, energies_Ha):
                 fh.write(f"{r.cid}\t{E:.12f}\n")
 
-        # 5. Write metadata
+        # 6. Write metadata
         meta = {
             "xc": args.xc,
             "basis": args.basis,

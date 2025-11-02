@@ -841,6 +841,89 @@ def compute_spinspin_JHz(
     return (J_Hz, labels)
 
 
+def compute_sigma_and_J_once(
+        symbols: Sequence[str],
+        coords_A: np.ndarray,
+        charge: int,
+        spin: int,
+        xc: str,
+        basis: str,
+        use_gpu: bool,
+        isotopes_keep: Sequence[str],
+        need_J: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """
+    Compute BOTH, with a single expensive SCF:
+
+      - per-atom isotropic shielding σ_iso (for chemical shifts)
+      - scalar spin–spin coupling matrix J (Hz) for selected isotopes
+
+    Steps:
+      1. build mol
+      2. run SCF once (GPU if allowed)
+      3. clone to CPU MF via _property_on_cpu(...)
+      4. from that SAME CPU MF:
+         - NMR shielding tensors → σ_iso
+         - SSC → J_Hz (if need_J)
+
+    If need_J is False, we skip SSC entirely and return
+    J_Hz = array([]).reshape(0,0), labels = [].
+
+    Returns:
+        (sigma_iso, J_Hz, labels)
+
+        sigma_iso : (natm,) float
+            isotropic shielding for each atom in `symbols`
+
+        J_Hz : (M,M) float
+            dense symmetric J matrix in Hz for the kept nuclei
+            (0x0 if need_J is False)
+
+        labels : list[str] length M
+            nucleus labels ("H12", "C3", ...) matching rows/cols of J_Hz
+            ([] if need_J is False)
+    """
+    # 1. Molecule
+    mol = make_mol(symbols, coords_A, charge, spin, basis)
+
+    # 2. SCF once (GPU-capable mf)
+    mf = build_scf(mol, xc, use_gpu=use_gpu)
+    _ = mf.kernel()
+
+    # 3. CPU clone seeded from that SCF density
+    mf_cpu = _property_on_cpu(mol, mf, xc)
+
+    # 4a. Shieldings from mf_cpu
+    arr = np.asarray(nmr_tensors_from_mf(mf_cpu))
+
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        # full 3x3 tensors → trace/3
+        sigma_iso = (np.trace(arr, axis1=1, axis2=2) / 3.0).astype(float)
+    elif arr.ndim == 1:
+        # already isotropic per atom
+        sigma_iso = arr.astype(float)
+    elif arr.ndim == 2 and arr.shape[1] == 3:
+        # principal components → mean
+        sigma_iso = arr.mean(axis=1).astype(float)
+    else:
+        # fallback: mean of diagonal elements
+        sigma_iso = (
+            np.diagonal(arr, axis1=-2, axis2=-1).mean(axis=-1).astype(float)
+        )
+
+    # 4b. Optional spin–spin couplings on the SAME mf_cpu
+    if need_J:
+        (J_Hz, labels) = _build_J_matrix_Hz(
+            mf_cpu,
+            isotopes_keep=isotopes_keep,
+        )
+    else:
+        J_Hz = np.zeros((0, 0), dtype=float)
+        labels = []
+
+    return (sigma_iso, J_Hz, labels)
+
+
 def assert_ssc_available_fast(
         xc: str,
         basis: str,
