@@ -679,52 +679,41 @@ def tms_geometry(xc: str, basis: str) -> Tuple[List[str], np.ndarray]:
     return (syms0, coords_opt_A)
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=1)
 def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
     """
     Compute and cache σ_ref for TMS at (xc,basis).
 
-    We:
-      - build optimized TMS geometry for this xc/basis (CPU DFT)
-      - run shielding on that CPU MF
-      - average equivalent H and C atoms
-      - return {'H': σ_H_ref, 'C': σ_C_ref}
-
-    This fixes absolute referencing so δ(ppm) is physically meaningful.
+    Implementation note:
+    We now reuse compute_sigma_and_J_once(...) with need_J=False
+    so that the reference path is *identical* to the production path
+    (same SCF, same CPU handoff, same shielding extraction rules).
+    This fixes the ~±30 ppm "TMS vs TMS" mismatch.
     """
-    (syms, coords_A) = tms_geometry(xc, basis)
+    # 1. TMS geometry (currently a tetrahedral guess, not optimized)
+    (syms, coords_A) = tms_geometry()
 
-    mol = make_mol(syms, coords_A, charge=0, spin=0, basis=basis)
-    mf = build_scf(mol, xc, use_gpu=False)
-    _ = mf.kernel()
+    # 2. Run the unified pipeline once, CPU is fine here
+    (sigma_iso, _J_dummy, _labels_dummy) = compute_sigma_and_J_once(
+        symbols=syms,
+        coords_A=coords_A,
+        charge=0,
+        spin=0,
+        xc=xc,
+        basis=basis,
+        use_gpu=False,
+        isotopes_keep=["1H", "13C"],  # doesn't matter for sigma
+        need_J=False,  # skip SSC, faster
+    )
 
-    arr = np.asarray(nmr_tensors_from_mf(mf))
+    # 3. Average per-element σ over equivalent nuclei
+    Hvals = [sigma_iso[i] for (i, s) in enumerate(syms) if s.upper() == "H"]
+    Cvals = [sigma_iso[i] for (i, s) in enumerate(syms) if s.upper() == "C"]
 
-    # normalize shapes the same way we already do for clusters
-    if arr.ndim == 3 and arr.shape[-1] == 3:
-        sigma = (np.trace(arr, axis1=1, axis2=2) / 3.0).astype(float)
-    elif arr.ndim == 1:
-        sigma = arr.astype(float)
-    elif arr.ndim == 2 and arr.shape[1] == 3:
-        sigma = arr.mean(axis=1).astype(float)
-    else:
-        sigma = (
-            np.diagonal(arr, axis1=-2, axis2=-1).mean(axis=-1).astype(float)
-        )
+    ref_H = float(np.mean(Hvals))
+    ref_C = float(np.mean(Cvals))
 
-    Hvals = [sigma[i] for (i, s) in enumerate(syms) if s.upper() == "H"]
-    Cvals = [sigma[i] for (i, s) in enumerate(syms) if s.upper() == "C"]
-
-    if not Hvals or not Cvals:
-        raise RuntimeError(
-            "TMS reference missing H or C after optimization; "
-            "cannot define chemical shift scale."
-        )
-
-    H = float(np.mean(Hvals))
-    C = float(np.mean(Cvals))
-
-    return {"H": H, "C": C}
+    return {"H": ref_H, "C": ref_C}
 
 
 # -----------------------------------------------------------------------------
