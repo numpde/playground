@@ -3,36 +3,54 @@
 #
 # Heavy step:
 #   - for each conformer cluster:
-#       * run DFT (PySCF) to get isotropic shielding σ_iso
-#       * convert to chemical shifts δ (ppm) vs TMS ref
-#       * (optionally) compute scalar spin–spin J couplings (Hz)
-#       * compute ddCOSMO single-point energy for Boltzmann weights
-#       * write all cluster-level outputs
+#       * SCF (DFT) at given xc/basis (GPU if allowed for SCF only)
+#       * isotropic shielding σ_iso → chemical shifts δ (ppm) vs TMS
+#       * scalar spin–spin J couplings (Hz) from SSC, if available
+#       * ddCOSMO single-point energy (Hartree) for Boltzmann weights
 #
-# Also writes (per tag):
-#   - energies_<solvent_key>.tsv         (per-cluster energies in Ha)
-#   - params_compute.txt                 (metadata for this tag/solvent)
+# Per-cluster outputs (in f_predict_shifts/<tag>/):
+#   - cluster_<cid>_shifts.tsv
+#       atom_idx, atom_name, element, σ_iso, δ(ppm)
+#   - cluster_<cid>_j_couplings.tsv         [if J available]
+#       i, j, label_i, label_j, J_Hz (upper triangle)
+#   - cluster_<cid>_J.npy                    [if J available]
+#       dense (M,M) J matrix in Hz
+#   - cluster_<cid>_J_labels.txt             [if J available]
+#       nucleus labels in the J matrix order
 #
-# Also writes (per cluster):
-#   - cluster_<cid>_shifts.tsv           (σ_iso and δ per atom)
-#   - cluster_<cid>_j_couplings.tsv      (upper triangle J_ij in Hz) [if J ok]
-#   - cluster_<cid>_J.npy                (full J matrix, Hz)         [if J ok]
-#   - cluster_<cid>_J_labels.txt         (spin labels order)         [if J ok]
+# Per-tag outputs:
+#   - energies_<solvent_key>.tsv
+#       cid, ddCOSMO single-point energy (Hartree)
+#   - params_compute.txt
+#       method/basis/etc., and ssc_available=0/1
 #
-# 2025-11-02:
-#   - add SSC/J preflight check
-# 2025-11-02b:
-#   - make SSC/J optional:
-#       * new --require-j
-#       * if SSC unavailable and --require-j not set, continue without J
+# Behavior of --require-j:
+#   We now do a robust SSC/J preflight (assert_ssc_available_fast):
+#     - build tiny H2, run SCF on CPU,
+#     - call SSC, reduce pair tensors → scalar J,
+#     - verify finite square J matrix.
+#   If that fails:
+#     * with --require-j → abort before any expensive work
+#     * without --require-j → continue but skip J outputs
+#
+# This file assumes f_predict_shifts_core provides:
+#   - compute_sigma_iso(), sigma_to_delta(), tms_ref_sigma()
+#   - compute_spinspin_JHz()  (wraps SSC and builds J matrix)
+#   - sp_energy_pcm()
+#   - assert_ssc_available_fast()  (updated to be tolerant of PySCF formats)
+#   - write_cluster_shifts(), write_j_couplings(), write_params()
+#   - load_clusters_table(), read_pdb_atoms(), get_charge_spin()
+#   - SOLVENT_EPS map, etc.
+#
+# :contentReference[oaicite:0]{index=0}
+
 
 from __future__ import annotations
 
 import argparse
 import logging
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
-import numpy as np
 import pyscf
 
 from f_predict_shifts_core import (
@@ -62,93 +80,81 @@ LOG = logging.getLogger("nmrshifts.compute")
 def parse_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Compute per-cluster NMR shifts, scalar J couplings (if available), "
-            "and PCM energies."
+            "Per-cluster quantum step: chemical shifts δ (ppm), "
+            "scalar J couplings (Hz, if available), and ddCOSMO energies."
         )
     )
+
     p.add_argument(
         "--tags",
         type=str,
         nargs="*",
-        help="Tags to process (default: all *_clusters.tsv).",
+        help="Tags to process (default: infer from *_clusters.tsv).",
     )
+
     p.add_argument("--xc", type=str, default="b3lyp", help="DFT functional.")
     p.add_argument("--basis", type=str, default="def2-tzvp", help="Basis set.")
+
     p.add_argument(
         "--gpu",
         choices=["auto", "on", "off"],
         default="auto",
-        help="Use gpu4pyscf if available.",
+        help="Try gpu4pyscf for SCF (properties still run on CPU).",
     )
+
     p.add_argument(
         "--solvent",
         type=str,
         default="DMSO",
-        help="Solvent name for PCM weighting energies (e.g., DMSO, CDCl3).",
+        help="Solvent label for ddCOSMO weighting (e.g. DMSO, CDCl3).",
     )
     p.add_argument(
         "--eps",
         type=float,
         default=None,
-        help="Override dielectric; if set, overrides --solvent.",
+        help="Override dielectric constant for ddCOSMO. "
+             "If set, overrides --solvent.",
     )
+
     p.add_argument(
         "--keep-isotopes",
         type=str,
         nargs="*",
         default=["1H"],
         help=(
-            'Which nuclei to include in J (default: 1H only). '
-            'Add "13C" if you also want heteronuclear couplings for HSQC etc.'
+            'Which nuclei to include in J (default: 1H). '
+            'Add "13C" etc. if you want heteronuclear couplings.'
         ),
     )
+
     p.add_argument(
         "--require-j",
         action="store_true",
         help=(
-            "If set, abort the run if SSC/J couplings are not available. "
-            "Default: continue but skip J."
+            "Abort early if SSC/J is not usable. "
+            "Without this flag, we still run shifts/energies and just skip J."
         ),
     )
+
     p.add_argument(
         "--no-opt",
         action="store_true",
-        help="(Reserved) Skip geometry opt (currently always skipped).",
+        help="Reserved (geometry opt currently not performed).",
+    )
+
+    p.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="DEBUG, INFO, WARNING, ERROR.",
     )
     p.add_argument(
-        "--log-level", type=str, default="INFO", help="DEBUG, INFO, WARNING, ERROR."
+        "--quiet",
+        action="store_true",
+        help="Reduce informational logging.",
     )
-    p.add_argument(
-        "--quiet", action="store_true", help="Reduce informational messages."
-    )
+
     return p.parse_args()
-
-
-def _save_J_aux(
-        out_dir: "PathLike[str] | PathLike[bytes] | str",
-        tag: str,
-        cid: int,
-        labels: Sequence[str],
-        J_Hz: np.ndarray,
-) -> None:
-    """
-    Persist machine-readable J matrix and its ordering for downstream steps.
-
-    cluster_<cid>_J.npy:
-        np.save() of full square matrix [M,M] in Hz
-    cluster_<cid>_J_labels.txt:
-        one label per line, order matches axes of J.npy
-    """
-    base = OUT_DIR / tag
-    base.mkdir(parents=True, exist_ok=True)
-
-    npy_path = base / f"cluster_{cid}_J.npy"
-    np.save(npy_path, J_Hz.astype(float))
-
-    lbl_path = base / f"cluster_{cid}_J_labels.txt"
-    with lbl_path.open("w") as fh:
-        for lbl in labels:
-            fh.write(f"{lbl}\n")
 
 
 def main() -> None:
@@ -156,14 +162,14 @@ def main() -> None:
     setup_logging(args.log_level, args.quiet)
     mkdir_p(OUT_DIR)
 
-    # Decide GPU usage
+    # GPU policy for SCF
     gpu_info = detect_gpu()
     use_gpu = (args.gpu == "on") or (args.gpu == "auto" and gpu_info["gpu4pyscf"])
     if use_gpu and not gpu_info["gpu4pyscf"]:
-        LOG.warning("GPU requested but gpu4pyscf not available; running CPU.")
+        LOG.warning("GPU requested but gpu4pyscf not available; forcing CPU.")
         use_gpu = False
 
-    # Figure out dielectric / solvent key for energies
+    # dielectric and solvent key for output filenames
     eps = (
         float(args.eps)
         if args.eps is not None
@@ -185,13 +191,19 @@ def main() -> None:
         ("off" if eps is None else f"ddCOSMO eps={eps:.2f}"),
     )
 
-    # ---------------------------------------------------------------------
-    # SSC/J preflight:
-    # Try a tiny dummy system so we know if PySCF can compute spin-spin
-    # couplings. If not:
-    #   - if --require-j: abort now
-    #   - else: continue but skip J
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Robust SSC/J preflight.
+    #
+    # We call assert_ssc_available_fast(), which:
+    #   - builds a tiny H2 on CPU
+    #   - runs SCF
+    #   - tries SSC
+    #   - reduces pair tensors → isotropic J (Hz)
+    #   - checks for finite, square result
+    #
+    # If that fails and --require-j is set, we stop NOW (before hours of SCF).
+    # Otherwise we just log and continue with j_ok=False.
+    # -------------------------------------------------------------------------
     try:
         assert_ssc_available_fast(
             xc=args.xc,
@@ -203,19 +215,19 @@ def main() -> None:
         j_ok = False
         if args.require_j:
             LOG.error(
-                "Spin-spin coupling (SSC/J) not available in this environment: %s",
+                "Spin–spin coupling (SSC/J) preflight failed: %s",
                 e,
             )
-            LOG.error("--require-j was set -> aborting before heavy SCF.")
+            LOG.error(
+                "--require-j was set → aborting before heavy SCF."
+            )
             return
-        else:
-            LOG.warning(
-                "J couplings (PySCF SSC) unavailable (%s). "
-                "Will continue and skip J outputs.",
-                e,
-            )
+        LOG.warning(
+            "J couplings will be skipped (SSC preflight failed: %s).",
+            e,
+        )
 
-    # Discover tags if not given
+    # Discover tags if the user didn't pass any
     if args.tags:
         tags = args.tags
     else:
@@ -225,27 +237,27 @@ def main() -> None:
             return
         tags = [cf.stem.removesuffix("_clusters") for cf in cfs]
 
-    # Process each tag independently
+    # Process each tag
     for tag in tags:
         LOG.info("[tag] %s", tag)
         table = load_clusters_table(CLUSTERS_DIR / f"{tag}_clusters.tsv", tag)
 
-        # Guess global charge / spin multiplicity from tag name
+        # crude global charge, multiplicity guess from tag name
         (charge, spin) = get_charge_spin(tag)
 
-        # Reference σ(TMS) so we can convert σ_iso → δ (ppm)
+        # TMS reference σ_ref so we can report δ(ppm)
         ref_sigma = tms_ref_sigma(args.xc, args.basis)
 
         energies_Ha: List[float] = []
         first_labels: Optional[List[str]] = None
 
-        # Loop over clusters in this tag
+        # per-cluster loop
         for row in table:
             atom_names, symbols, coords_A = read_pdb_atoms(row.rep_pdb)
 
             LOG.info("  [cluster %s] %s", row.cid, row.rep_pdb.name)
 
-            # 1. Shieldings σ_iso → shifts δ ppm
+            # 1. Shielding tensors → σ_iso → chemical shifts δ
             sigma_iso = compute_sigma_iso(
                 symbols,
                 coords_A,
@@ -255,9 +267,17 @@ def main() -> None:
                 args.basis,
                 use_gpu=use_gpu,
             )
+
             delta_ppm = sigma_to_delta(symbols, sigma_iso, ref_sigma)
+
             write_cluster_shifts(
-                OUT_DIR, tag, row.cid, atom_names, symbols, sigma_iso, delta_ppm
+                OUT_DIR,
+                tag,
+                row.cid,
+                atom_names,
+                symbols,
+                sigma_iso,
+                delta_ppm,
             )
 
             # 2. Scalar spin–spin couplings J_ij in Hz (only if j_ok)
@@ -275,14 +295,13 @@ def main() -> None:
                     )
 
                     if J_Hz.size:
-                        # human TSV + machine npy/txt
                         write_j_couplings(
-                            OUT_DIR, tag, row.cid, kept_labels, J_Hz
+                            OUT_DIR,
+                            tag,
+                            row.cid,
+                            kept_labels,
+                            J_Hz,
                         )
-                        _save_J_aux(
-                            OUT_DIR, tag, row.cid, kept_labels, J_Hz
-                        )
-
                         if first_labels is None:
                             first_labels = list(kept_labels)
                     else:
@@ -301,11 +320,11 @@ def main() -> None:
                     )
             else:
                 LOG.debug(
-                    "    [cluster %s] Skipping J couplings (SSC unavailable).",
+                    "    [cluster %s] Skipping J couplings (SSC disabled).",
                     row.cid,
                 )
 
-            # 3. ddCOSMO single-point energy (Hartree) for Boltzmann weights
+            # 3. ddCOSMO single-point energy in Hartree
             e_pcm = sp_energy_pcm(
                 symbols,
                 coords_A,
@@ -326,7 +345,7 @@ def main() -> None:
             for r, E in zip(table, energies_Ha):
                 fh.write(f"{r.cid}\t{E:.12f}\n")
 
-        # 5. Write run metadata
+        # 5. Write metadata
         meta = {
             "xc": args.xc,
             "basis": args.basis,
@@ -337,9 +356,9 @@ def main() -> None:
             "keep_isotopes": args.keep_isotopes,
             "ssc_available": int(j_ok),
             "notes": (
-                "Per-cluster shieldings (gas-phase), scalar J couplings (Hz, "
-                "if available), and ddCOSMO single-point energies (Hartree) "
-                "for Boltzmann weighting."
+                "Per-cluster shieldings σ_iso and δ(ppm), scalar J couplings "
+                "(Hz, if ssc_available=1), and ddCOSMO single-point "
+                "energies (Hartree) for Boltzmann weighting."
             ),
         }
         if first_labels is not None:
