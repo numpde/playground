@@ -1,7 +1,8 @@
 xc: b3lyp
-basis: def2-svp
+basis: def2-tzvp
 charge_spin: (0, 0)
 gpu: True
 pcm_eps: 4.81
 solvent_key: cdcl3
-notes: Per-cluster shieldings (gas-phase) & PCM energies for weighting.
+notes: Per-cluster shieldings (gas-phase), scalar J couplings (Hz) and ddCOSMO single-point energies (Hartree) for Boltzmann weighting.
+keep_isotopes: ['1H']
