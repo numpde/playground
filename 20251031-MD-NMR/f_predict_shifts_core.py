@@ -1002,14 +1002,52 @@ def sp_energy_pcm(
 ) -> float:
     """
     Single-point energy (Hartree) for this geometry.
-    We try to attach ddCOSMO with dielectric eps. gpu4pyscf MFs usually
-    can't be wrapped directly, so attach_pcm() may fall back to gas-phase.
+
+    Behavior:
+      1. Build the molecule.
+      2. Run ONE gas-phase SCF with build_scf(..., use_gpu=use_gpu),
+         and fully converge it (.kernel()) to get a good density.
+         This gives us a decent starting density cheaply (GPU if allowed).
+      3. If no solvent model (eps is None):
+           -> return that gas-phase energy directly (mf0.e_tot).
+      4. If solvent model requested (eps not None):
+           -> build a CPU MF seeded from that converged density
+              via _property_on_cpu(...)
+           -> attach ddCOSMO (attach_pcm) on that CPU MF
+           -> run that PCM SCF on CPU
+           -> return the solvent-corrected total energy.
+
+    Why:
+    - gpu4pyscf RKS/UKS objects can't be wrapped with ddCOSMO directly.
+    - Previously we tried attach_pcm() on the GPU object and fell back
+      to gas-phase with a warning. That means we were silently ignoring
+      the requested dielectric.
+    - Now we ALWAYS get proper ddCOSMO energy if eps is not None,
+      by cloning to CPU first.
+
+    Returns:
+        float Hartree total energy (PCM if eps given, else gas-phase).
     """
+    # 1. Molecule
     mol = make_mol(symbols, coords_A, charge, spin, basis)
+
+    # 2. Gas-phase SCF once (GPU if allowed)
     mf0 = build_scf(mol, xc, use_gpu=use_gpu)
-    mf_pcm = attach_pcm(mf0, eps=eps)
-    e_tot = mf_pcm.kernel()
-    return float(e_tot)
+    _ = mf0.kernel()  # converge the vacuum SCF
+
+    # 3. If no solvent requested -> just use that result
+    if eps is None:
+        # mf0.e_tot should now be populated by kernel()
+        return float(mf0.e_tot)
+
+    # 4. Solvent requested:
+    #    Move density to a fresh CPU MF, then attach ddCOSMO and solve again.
+    mf_cpu = _property_on_cpu(mol, mf0, xc)
+    mf_pcm = attach_pcm(mf_cpu, eps=eps)
+
+    # Run the PCM-wrapped SCF on CPU
+    e_tot_pcm = mf_pcm.kernel()
+    return float(e_tot_pcm)
 
 
 def boltzmann_weights(E_hartree: Sequence[float], T_K: float) -> np.ndarray:
