@@ -609,48 +609,50 @@ def _optimize_geometry_cpu(
         basis: str,
 ) -> np.ndarray:
     """
-    Return optimized Cartesian coords (Å) for a given starting geometry.
-    CPU only. Tries full Berny optimization if available; otherwise
-    does a single gradient-driven relaxation step as a fallback.
+    Return Cartesian coords (Å) for TMS suitable for use as a reference.
 
-    We prefer to raise loudly only if *both* SCF and even a single-step
-    gradient call fail. If Berny is missing, we LOG.warning but continue.
+    Policy:
+      - If Berny geometry optimization is available and succeeds, use that.
+      - Otherwise, DO NOT half-relax with a crude gradient step (that
+        breaks Td symmetry and creates multiple inequivalent methyls).
+        Instead, just return the symmetric analytic guess unchanged.
+
+    Rationale:
+      For referencing, internal self-consistency matters more than
+      micro-optimizing bond lengths. We want all 13C nuclei in TMS to
+      be equivalent so that δ(TMS) ≈ 0 ppm for every carbon and proton.
     """
-    # Build mol for initial coords
+    # Build initial mol on CPU
     mol0 = make_mol(syms, coords_A_init, charge, spin, basis)
 
-    # Plain CPU SCF object (we do *not* want GPU here for reference)
+    # Plain CPU SCF to make sure the guess is at least sane
     mf0 = build_scf(mol0, xc, use_gpu=False)
     _ = mf0.kernel()
 
-    # If Berny is available, do a proper optimization loop
+    # Try Berny optimization if available
     if BERNY_AVAILABLE:
         try:
             from pyscf.geomopt.berny_solver import kernel as berny_kernel  # type: ignore
-
             mol_opt = berny_kernel(mf0, assert_convergence=True)
-            return np.asarray(mol_opt.atom_coords(unit="Angstrom"), dtype=float)
+            coords_opt = np.asarray(
+                mol_opt.atom_coords(unit="Angstrom"),
+                dtype=float,
+            )
+            return coords_opt
         except Exception as e:
-            LOG.warning("Berny optimization failed (%s); fallback step.", e)
+            LOG.warning(
+                "Berny optimization failed (%s); "
+                "falling back to symmetric guess.",
+                e,
+            )
 
-    # Fallback: take one gradient step along -grad just to relax bonds a bit.
-    # This is not a full optimization but better than raw sketch.
-    try:
-        # Cartesian gradient in Hartree/Bohr
-        g_bohr = mf0.nuc_grad_method().kernel()  # (N,3) in Ha/Bohr
-        coords_bohr = mol0.atom_coords(unit="Bohr")
-        # crude step
-        step_bohr = -0.1 * g_bohr
-        new_bohr = coords_bohr + step_bohr
-
-        # Build new coords in Å
-        Bohr2Ang = 0.529177210903
-        coords_A_new = np.asarray(new_bohr * Bohr2Ang, dtype=float)
-        return coords_A_new
-    except Exception as e:
-        LOG.error("Fallback gradient relaxation failed: %s", e)
-        # Last resort: return the input unchanged, but make it obvious upstream
-        return np.asarray(coords_A_init, dtype=float)
+    # Fallback: keep the original symmetric guess EXACTLY.
+    # Do NOT apply a manual gradient step.
+    LOG.warning(
+        "Berny geometry optimization not available; "
+        "using unoptimized symmetric TMS guess for reference."
+    )
+    return np.asarray(coords_A_init, dtype=float)
 
 
 @lru_cache(maxsize=8)
@@ -679,21 +681,25 @@ def tms_geometry(xc: str, basis: str) -> Tuple[List[str], np.ndarray]:
     return (syms0, coords_opt_A)
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=8)
 def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
     """
     Compute and cache σ_ref for TMS at (xc,basis).
 
-    Implementation note:
-    We now reuse compute_sigma_and_J_once(...) with need_J=False
-    so that the reference path is *identical* to the production path
-    (same SCF, same CPU handoff, same shielding extraction rules).
-    This fixes the ~±30 ppm "TMS vs TMS" mismatch.
-    """
-    # 1. TMS geometry (currently a tetrahedral guess, not optimized)
-    (syms, coords_A) = tms_geometry()
+    We intentionally reuse the exact same pipeline as production:
+    - same SCF path (including GPU→CPU handoff logic),
+    - same shielding extraction logic,
+    - same per-atom sigma_iso definition.
 
-    # 2. Run the unified pipeline once, CPU is fine here
+    That guarantees that if we run TMS itself through the main
+    compute path and then convert σ→δ using this σ_ref, all TMS
+    1H and 13C should come out near 0 ppm.
+    """
+
+    # 1. Get (possibly optimized) TMS geometry for this level of theory
+    (syms, coords_A) = tms_geometry(xc, basis)
+
+    # 2. Run the unified sigma/J routine ONCE on CPU (use_gpu=False here is fine)
     (sigma_iso, _J_dummy, _labels_dummy) = compute_sigma_and_J_once(
         symbols=syms,
         coords_A=coords_A,
@@ -702,13 +708,16 @@ def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
         xc=xc,
         basis=basis,
         use_gpu=False,
-        isotopes_keep=["1H", "13C"],  # doesn't matter for sigma
-        need_J=False,  # skip SSC, faster
+        isotopes_keep=["1H", "13C"],
+        need_J=False,
     )
 
-    # 3. Average per-element σ over equivalent nuclei
+    # 3. Average per-element shielding to get σ_ref
     Hvals = [sigma_iso[i] for (i, s) in enumerate(syms) if s.upper() == "H"]
     Cvals = [sigma_iso[i] for (i, s) in enumerate(syms) if s.upper() == "C"]
+
+    if not Hvals or not Cvals:
+        raise RuntimeError("TMS σ_ref: missing H or C after optimization")
 
     ref_H = float(np.mean(Hvals))
     ref_C = float(np.mean(Cvals))
