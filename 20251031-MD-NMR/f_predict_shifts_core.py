@@ -1559,37 +1559,77 @@ def write_j_couplings(
         cid: int,
         labels: Sequence[str],
         J_Hz: np.ndarray,
+        atom_names: Sequence[str],
 ) -> Tuple[Path, Path, Path]:
     """
     Write scalar spin–spin coupling info for this cluster:
 
         cluster_<cid>_J.npy
             dense symmetric (M,M) in Hz
+
         cluster_<cid>_J_labels.txt
-            nucleus labels in matrix order
+            nucleus labels in matrix order (e.g. H4, H5, ...)
+
         cluster_<cid>_j_couplings.tsv
-            upper triangle, human-readable
+            upper triangle, human-readable with PDB names:
+            i, j, label_i, pdb_i, label_j, pdb_j, J_Hz
+
+    We enrich the TSV with the original PDB atom names so you can map
+    H4 -> e.g. "H8x" from the input cluster geometry.
+
+    We assume that each label in `labels` ends with an integer that
+    matches the 1-based atom index in the SCF/PDB ordering:
+        "H4" -> atom index 3 -> atom_names[3].
+
+    If parsing fails, we fall back to "?" for the pdb_i/pdb_j column.
     """
     base_dir = out_dir / tag
     base_dir.mkdir(parents=True, exist_ok=True)
 
+    def _label_to_pdb_name(lbl: str) -> str:
+        # Extract trailing digits from lbl (e.g. "H12" -> "12")
+        digits_rev: List[str] = []
+        for ch in reversed(lbl):
+            if ch.isdigit():
+                digits_rev.append(ch)
+            else:
+                break
+        if not digits_rev:
+            return "?"
+        digits = "".join(reversed(digits_rev))
+        try:
+            atom_idx_1based = int(digits)
+        except ValueError:
+            return "?"
+        atom_idx_0based = atom_idx_1based - 1
+        if 0 <= atom_idx_0based < len(atom_names):
+            return str(atom_names[atom_idx_0based])
+        return "?"
+
+    # Dense J matrix
     npy_path = base_dir / f"cluster_{cid}_J.npy"
     np.save(npy_path, J_Hz.astype(float))
 
+    # Labels file
     lbl_path = base_dir / f"cluster_{cid}_J_labels.txt"
     with lbl_path.open("w") as fh_lbl:
         for lbl in labels:
             fh_lbl.write(f"{lbl}\n")
 
+    # Human TSV (upper triangle only)
     tsv_path = base_dir / f"cluster_{cid}_j_couplings.tsv"
     with tsv_path.open("w") as fh_tsv:
-        fh_tsv.write("# i\tj\tlabel_i\tlabel_j\tJ_Hz\n")
+        fh_tsv.write("# i\tj\tlabel_i\tpdb_i\tlabel_j\tpdb_j\tJ_Hz\n")
         n = len(labels)
         for i in range(n):
             for j in range(i + 1, n):
+                lbl_i = labels[i]
+                lbl_j = labels[j]
+                pdb_i = _label_to_pdb_name(lbl_i)
+                pdb_j = _label_to_pdb_name(lbl_j)
+                Jij = float(J_Hz[i, j])
                 fh_tsv.write(
-                    f"{i}\t{j}\t{labels[i]}\t{labels[j]}\t"
-                    f"{fmt(float(J_Hz[i, j]))}\n"
+                    f"{i}\t{j}\t{lbl_i}\t{pdb_i}\t{lbl_j}\t{pdb_j}\t{fmt(Jij)}\n"
                 )
 
     return (npy_path, lbl_path, tsv_path)

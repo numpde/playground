@@ -304,6 +304,7 @@ def main() -> None:
                     row.cid,
                     kept_labels,
                     J_Hz,
+                    atom_names,
                 )
                 if first_labels is None:
                     first_labels = list(kept_labels)
