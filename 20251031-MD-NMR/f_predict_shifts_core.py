@@ -1092,6 +1092,110 @@ def compute_sigma_and_J_once(
     return (sigma_iso, J_Hz, labels)
 
 
+def compute_sigma_J_and_energy_once(
+        symbols: Sequence[str],
+        coords_A: np.ndarray,
+        charge: int,
+        spin: int,
+        xc: str,
+        basis: str,
+        use_gpu: bool,
+        isotopes_keep: Sequence[str],
+        need_J: bool,
+        eps: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray, List[str], float]:
+    """
+    One-stop heavy call for a single geometry.
+
+    It does ALL of this with a single primary SCF:
+      - run SCF (GPU if allowed) in the gas phase
+      - clone that state onto a CPU MF (mf_cpu)
+      - from mf_cpu:
+          * get NMR shielding tensors -> per-atom σ_iso
+          * get SSC -> dense J matrix in Hz (if need_J)
+      - get energy:
+          * if eps is None: just report gas-phase energy (Hartree)
+            from the converged SCF
+          * else: wrap mf_cpu in ddCOSMO(eps), run that once on CPU,
+            and report the solvent-corrected total energy (Hartree)
+
+    Returns:
+        (sigma_iso, J_Hz, labels, e_tot)
+
+        sigma_iso : (natm,) float
+            isotropic shielding per atom
+
+        J_Hz : (M,M) float
+            symmetric scalar spin–spin couplings (Hz) for kept nuclei
+            (0x0 if need_J == False)
+
+        labels : list[str] length M
+            nucleus labels ("H4", "C2", ...) matching rows/cols of J_Hz
+            ([] if need_J == False)
+
+        e_tot : float
+            total electronic energy in Hartree.
+            Gas-phase if eps is None,
+            ddCOSMO(eps) if eps is not None.
+
+    Why this exists:
+        In f_predict_shifts_compute.py we were doing
+        (1) SCF -> σ_iso,J
+        (2) SCF again -> energy/PCM
+        which doubles cost per cluster. Now callers can do it once.
+    """
+    # 1. Build molecule
+    mol = make_mol(symbols, coords_A, charge, spin, basis)
+
+    # 2. Run SCF ONCE (GPU if allowed)
+    mf = build_scf(mol, xc, use_gpu=use_gpu)
+    _ = mf.kernel()  # gas-phase SCF
+
+    # 3. Create a CPU MF seeded from that density
+    mf_cpu = _property_on_cpu(mol, mf, xc)
+
+    # ---- Shielding σ_iso from mf_cpu -------------------------------------
+    arr = np.asarray(nmr_tensors_from_mf(mf_cpu))
+
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        # full 3x3 shielding tensors -> trace/3
+        sigma_iso = (np.trace(arr, axis1=1, axis2=2) / 3.0).astype(float)
+    elif arr.ndim == 1:
+        # already isotropic per atom
+        sigma_iso = arr.astype(float)
+    elif arr.ndim == 2 and arr.shape[1] == 3:
+        # principal components given -> mean
+        sigma_iso = arr.mean(axis=1).astype(float)
+    else:
+        # fallback: mean of diagonal elements
+        sigma_iso = (
+            np.diagonal(arr, axis1=-2, axis2=-1).mean(axis=-1).astype(float)
+        )
+
+    # ---- Spin–spin J (Hz) from the SAME mf_cpu ---------------------------
+    if need_J:
+        (J_Hz, labels) = _build_J_matrix_Hz(
+            mf_cpu,
+            isotopes_keep=isotopes_keep,
+        )
+    else:
+        J_Hz = np.zeros((0, 0), dtype=float)
+        labels = []
+
+    # ---- Energy (Hartree), with optional ddCOSMO -------------------------
+    if eps is None:
+        # vacuum energy from the converged SCF;
+        # mf_cpu.e_tot should now reflect that SCF
+        e_tot = float(mf_cpu.e_tot)
+    else:
+        # wrap mf_cpu with ddCOSMO and solve once on CPU
+        mf_pcm = attach_pcm(mf_cpu, eps=eps)
+        e_tot_pcm = mf_pcm.kernel()
+        e_tot = float(e_tot_pcm)
+
+    return (sigma_iso, J_Hz, labels, e_tot)
+
+
 def assert_ssc_available_fast(
         xc: str,
         basis: str,
