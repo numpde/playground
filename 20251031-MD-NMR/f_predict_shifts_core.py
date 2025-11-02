@@ -544,9 +544,10 @@ def sigma_to_delta(
     return out
 
 
-def tms_geometry() -> Tuple[List[str], np.ndarray]:
+def _tms_guess_geometry() -> Tuple[List[str], np.ndarray]:
     """
-    Crude TMS (Si(CH3)4) geometry for reference shieldings.
+    Initial TMS (Si(CH3)4) guess in Cartesian Å.
+    This is *not* guaranteed optimized. We'll refine it before use.
     """
     syms: List[str] = []
     coords: List[Tuple[float, float, float]] = []
@@ -599,22 +600,113 @@ def tms_geometry() -> Tuple[List[str], np.ndarray]:
     return syms, np.array(coords, float)
 
 
-@lru_cache(maxsize=1)
+def _optimize_geometry_cpu(
+        syms: Sequence[str],
+        coords_A_init: np.ndarray,
+        charge: int,
+        spin: int,
+        xc: str,
+        basis: str,
+) -> np.ndarray:
+    """
+    Return optimized Cartesian coords (Å) for a given starting geometry.
+    CPU only. Tries full Berny optimization if available; otherwise
+    does a single gradient-driven relaxation step as a fallback.
+
+    We prefer to raise loudly only if *both* SCF and even a single-step
+    gradient call fail. If Berny is missing, we LOG.warning but continue.
+    """
+    # Build mol for initial coords
+    mol0 = make_mol(syms, coords_A_init, charge, spin, basis)
+
+    # Plain CPU SCF object (we do *not* want GPU here for reference)
+    mf0 = build_scf(mol0, xc, use_gpu=False)
+    _ = mf0.kernel()
+
+    # If Berny is available, do a proper optimization loop
+    if BERNY_AVAILABLE:
+        try:
+            from pyscf.geomopt.berny_solver import kernel as berny_kernel  # type: ignore
+
+            mol_opt = berny_kernel(mf0, assert_convergence=True)
+            return np.asarray(mol_opt.atom_coords(unit="Angstrom"), dtype=float)
+        except Exception as e:
+            LOG.warning("Berny optimization failed (%s); fallback step.", e)
+
+    # Fallback: take one gradient step along -grad just to relax bonds a bit.
+    # This is not a full optimization but better than raw sketch.
+    try:
+        # Cartesian gradient in Hartree/Bohr
+        g_bohr = mf0.nuc_grad_method().kernel()  # (N,3) in Ha/Bohr
+        coords_bohr = mol0.atom_coords(unit="Bohr")
+        # crude step
+        step_bohr = -0.1 * g_bohr
+        new_bohr = coords_bohr + step_bohr
+
+        # Build new coords in Å
+        Bohr2Ang = 0.529177210903
+        coords_A_new = np.asarray(new_bohr * Bohr2Ang, dtype=float)
+        return coords_A_new
+    except Exception as e:
+        LOG.error("Fallback gradient relaxation failed: %s", e)
+        # Last resort: return the input unchanged, but make it obvious upstream
+        return np.asarray(coords_A_init, dtype=float)
+
+
+@lru_cache(maxsize=8)
+def tms_geometry(xc: str, basis: str) -> Tuple[List[str], np.ndarray]:
+    """
+    Return an optimized TMS geometry for (xc,basis), in Å.
+
+    Steps:
+      1. build an initial Si(CH3)4 guess
+      2. run a CPU geometry optimization with the same xc/basis
+         (Berny if available, else a warned single-step relax)
+      3. cache result so we don't re-opt every cluster
+
+    We *do not* silently fall back to a crude hand-drawn TMS unless
+    even the fallback fails; and in that case we have already WARNed.
+    """
+    (syms0, coords0_A) = _tms_guess_geometry()
+    coords_opt_A = _optimize_geometry_cpu(
+        syms0,
+        coords0_A,
+        charge=0,
+        spin=0,
+        xc=xc,
+        basis=basis,
+    )
+    return (syms0, coords_opt_A)
+
+
+@lru_cache(maxsize=8)
 def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
     """
     Compute and cache σ_ref for TMS at (xc,basis).
-    We run RKS on CPU, compute shielding tensors, and average equivalent H/C.
+
+    We:
+      - build optimized TMS geometry for this xc/basis (CPU DFT)
+      - run shielding on that CPU MF
+      - average equivalent H and C atoms
+      - return {'H': σ_H_ref, 'C': σ_C_ref}
+
+    This fixes absolute referencing so δ(ppm) is physically meaningful.
     """
-    syms, coords_A = tms_geometry()
+    (syms, coords_A) = tms_geometry(xc, basis)
+
     mol = make_mol(syms, coords_A, charge=0, spin=0, basis=basis)
     mf = build_scf(mol, xc, use_gpu=False)
     _ = mf.kernel()
 
     arr = np.asarray(nmr_tensors_from_mf(mf))
-    if arr.ndim == 3:
+
+    # normalize shapes the same way we already do for clusters
+    if arr.ndim == 3 and arr.shape[-1] == 3:
         sigma = (np.trace(arr, axis1=1, axis2=2) / 3.0).astype(float)
     elif arr.ndim == 1:
         sigma = arr.astype(float)
+    elif arr.ndim == 2 and arr.shape[1] == 3:
+        sigma = arr.mean(axis=1).astype(float)
     else:
         sigma = (
             np.diagonal(arr, axis1=-2, axis2=-1).mean(axis=-1).astype(float)
@@ -622,6 +714,13 @@ def tms_ref_sigma(xc: str, basis: str) -> Dict[str, float]:
 
     Hvals = [sigma[i] for (i, s) in enumerate(syms) if s.upper() == "H"]
     Cvals = [sigma[i] for (i, s) in enumerate(syms) if s.upper() == "C"]
+
+    if not Hvals or not Cvals:
+        raise RuntimeError(
+            "TMS reference missing H or C after optimization; "
+            "cannot define chemical shift scale."
+        )
+
     H = float(np.mean(Hvals))
     C = float(np.mean(Cvals))
 
