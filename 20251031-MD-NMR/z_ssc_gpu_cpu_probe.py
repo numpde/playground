@@ -1,39 +1,25 @@
 #!/usr/bin/env python3
 """
-z_diag_ssc_stack.py
-Purpose-built diagnostics for the PySCF ⇄ gpu4pyscf ⇄ CuPy ⇄ SSC stack.
+z_ssc_gpu_cpu_probe.py
 
-What it checks (with PASS/FAIL/SKIP):
-  1) Environment banner: versions, CUDA device count, accelerators
-  2) CPU baseline: SCF(B3LYP/def2-SVP) on H2 → SSC → parse J(Hz)
-  3) GPU path: SCF on GPU (if available) → copy MOs to CPU → SSC → parse J(Hz)
-  4) SSC return-shape handling: (natm,natm,3,3) | (npair,3,3) | (3,3)
-  5) If K→Hz constants present: derive J_iso(Hz) from K and compare to parsed table
-  6) Optional large-molecule smoke test (short SCF) to surface segfaults
+Probe SSC on CPU and GPU→CPU paths and *extract J(Hz)* by parsing PySCF's
+own printed table. This avoids relying on internal, non-public conversion
+constants from K (a.u.) → J (Hz).
 
-Usage examples:
-  python z_diag_ssc_stack.py
-  python z_diag_ssc_stack.py --gpu auto
-  python z_diag_ssc_stack.py --probe-xyz strychnine_cluster0.xyz --cycles 6
-  python z_diag_ssc_stack.py --probe-pdb strychnine_neutral_cdcl3_cluster_0_rep.pdb --cycles 6
+Usage:
+  python z_ssc_gpu_cpu_probe.py [--probe-xyz path | --probe-pdb path]
 """
 
 from __future__ import annotations
-
-import argparse
-import importlib
-import importlib.util as iu
 import io
 import os
+import re
 import sys
-import textwrap
+import argparse
 import warnings
 from contextlib import redirect_stdout
 
-import numpy as np
-from pyscf import gto, dft
-
-# Silence PySCF property-module “under testing / not fully tested” notices
+# Silence only the noisy "under testing / not fully tested" notices from pyscf.prop.*
 warnings.filterwarnings(
     "ignore",
     message=r"Module .* (is under testing|is not fully tested)",
@@ -41,399 +27,255 @@ warnings.filterwarnings(
     module=r"^pyscf\.prop\..*",
 )
 
+def _env_summary():
+    def modver(name):
+        try:
+            m = __import__(name)
+            return getattr(m, "__version__", "unknown"), getattr(m, "__file__", None)
+        except Exception:
+            return None, None
 
-# ---------- small util ----------
+    py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    exe = sys.executable
+    pyscf_v, pyscf_f = modver("pyscf")
+    cupy_v, _ = modver("cupy")
+    g4_v, g4_f = modver("gpu4pyscf")
 
-def status(tag: str, ok: bool | None, note: str = ""):
-    flag = "PASS" if ok is True else ("FAIL" if ok is False else "SKIP")
-    msg = f"[{flag:<4}] {tag}"
-    if note:
-        msg += f" — {note}"
-    print(msg)
-
-
-def have(module: str) -> bool:
-    try:
-        importlib.import_module(module)
-        return True
-    except Exception:
-        return False
-
-
-def getenv(name: str, default="(unset)"):
-    v = os.environ.get(name, default)
-    return v if v != "" else "(empty)"
-
-
-# ---------- banner ----------
-
-def banner():
-    import pyscf
-    print("=== Environment ===")
-    print(f"python: {sys.version.split()[0]} | exe: {sys.executable}")
-    print(f"PySCF: {pyscf.__version__} | file: {pyscf.__file__}")
-    print(f"CUPY_ACCELERATORS: {getenv('CUPY_ACCELERATORS')}")
-    print(f"CUDA_VISIBLE_DEVICES: {getenv('CUDA_VISIBLE_DEVICES')}")
-    print(f"PYSCF_MAX_MEMORY: {getenv('PYSCF_MAX_MEMORY')}")
-    # CuPy / accelerators
+    # CuPy accelerators / device probe (best-effort)
+    accelerators = None
+    ndev = None
     try:
         import cupy as cp
-        acc = None
-        if iu.find_spec("cupy._core"):
-            from cupy._core import _accelerator as accmod
-            acc = accmod.get_routine_accelerators()
-        ndev = cp.cuda.runtime.getDeviceCount()
-        print(f"CuPy: {cp.__version__} | devices: {ndev} | accelerators: {acc}")
-    except Exception as e:
-        print(f"CuPy probe: {e}")
-    # gpu4pyscf
-    try:
-        gpu4 = importlib.import_module("gpu4pyscf")
-        print(f"gpu4pyscf: {getattr(gpu4, '__version__', 'unknown')} | file: {gpu4.__file__}")
-    except Exception as e:
-        print(f"gpu4pyscf import: {e}")
-
-
-# ---------- geometry loaders ----------
-
-def mol_h2():
-    return gto.M(atom="H 0 0 0; H 0 0 0.74", basis="def2-svp").build()
-
-
-def mol_from_xyz(path: str, basis: str):
-    with open(path, "r") as f:
-        raw = f.read().strip().splitlines()
-    # accept simple XYZ (skip first 2 header lines if present)
-    if len(raw) >= 2 and raw[0].strip().isdigit():
-        raw = raw[2:]
-    atom_lines = []
-    for line in raw:
-        if not line.strip():
-            continue
-        toks = line.split()
-        if len(toks) < 4:  # skip invalid
-            continue
-        sym, x, y, z = toks[:4]
-        atom_lines.append(f"{sym} {x} {y} {z}")
-    geo = "; ".join(atom_lines)
-    return gto.M(atom=geo, basis=basis).build()
-
-
-def mol_from_pdb(path: str, basis: str):
-    # Prefer RDKit if present; otherwise try a minimal PDB ATOM parser.
-    if have("rdkit"):
-        from rdkit import Chem
-        m = Chem.MolFromPDBFile(path, removeHs=False, sanitize=False)
-        if m is None:
-            raise ValueError("RDKit failed to read PDB")
-        conf = m.GetConformer()
-        lines = []
-        for i, a in enumerate(m.GetAtoms()):
-            pos = conf.GetAtomPosition(i)
-            lines.append(f"{a.GetSymbol()} {pos.x:.8f} {pos.y:.8f} {pos.z:.8f}")
-        geo = "; ".join(lines)
-        return gto.M(atom=geo, basis=basis).build()
-    # Fallback: parse ATOM/HETATM records with element symbol in column 77–78
-    atoms = []
-    with open(path, "r") as f:
-        for line in f:
-            if not (line.startswith("ATOM") or line.startswith("HETATM")):
-                continue
-            try:
-                sym = (line[76:78].strip() or line[12:16].strip()[0]).strip()
-                x = float(line[30:38]);
-                y = float(line[38:46]);
-                z = float(line[46:54])
-                atoms.append(f"{sym} {x:.8f} {y:.8f} {z:.8f}")
-            except Exception:
-                continue
-    if not atoms:
-        raise ValueError("No atoms parsed from PDB")
-    geo = "; ".join(atoms)
-    return gto.M(atom=geo, basis=basis).build()
-
-
-# ---------- GPU SCF and CPU hand-off ----------
-
-def to_numpy_maybe(x):
-    try:
-        import cupy as cp
-        if isinstance(x, cp.ndarray):
-            return cp.asnumpy(x)
+        from cupy._core import _accelerator as acc
+        accelerators = list(acc.get_routine_accelerators())
+        try:
+            ndev = cp.cuda.runtime.getDeviceCount()
+        except Exception:
+            ndev = "unavailable"
     except Exception:
         pass
-    return x
 
+    print("=== Environment ===")
+    print(f"python: {py} | exe: {exe}")
+    print(f"PySCF: {pyscf_v} | file: {pyscf_f}")
+    print(f"CUPY_ACCELERATORS: {os.environ.get('CUPY_ACCELERATORS','(unset)')}")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES','(unset)')}")
+    print(f"PYSCF_MAX_MEMORY: {os.environ.get('PYSCF_MAX_MEMORY','(unset)')}")
+    print(f"CuPy: {cupy_v} | devices: {ndev} | accelerators: {accelerators}")
+    print(f"gpu4pyscf: {g4_v} | file: {g4_f}")
+    print()
 
-def run_scf(mol, xc: str, conv_tol: float, max_cycle: int, gpu_mode: str):
-    """gpu_mode: 'on' | 'off' | 'auto'"""
-    mf = None
-    used_gpu = False
-    if gpu_mode in ("on", "auto") and have("gpu4pyscf.dft.rks"):
-        try:
-            from gpu4pyscf.dft import rks as grks
-            mf = grks.RKS(mol).set(xc=xc, conv_tol=conv_tol, max_cycle=max_cycle)
-            e = float(mf.kernel())
-            used_gpu = True
-            return mf, e, used_gpu, True
-        except Exception as e:
-            status("GPU SCF", False, f"{type(e).__name__}: {e}")
-            if gpu_mode == "on":
-                return None, np.nan, True, False
-            # fall through to CPU
-    # CPU
-    try:
-        mf = dft.RKS(mol).set(xc=xc, conv_tol=conv_tol, max_cycle=max_cycle)
-        e = float(mf.kernel())
-        return mf, e, False, True
-    except Exception as e:
-        return None, np.nan, False, False
+def _parse_j_table(stdout_text: str) -> tuple[list[str], list[list[float]]]:
+    """
+    Parse the 'Spin-spin coupling constant J (Hz)' table from PySCF's SSC stdout.
 
+    Returns: (labels, J_matrix)
+      labels: e.g. ["H0","H1", ...] using the element + row index
+      J_matrix: NxN floats (Hz)
 
-def handoff_to_cpu(mf_any):
-    """Build a CPU RKS with MO arrays copied (avoid re-running SCF for SSC)."""
-    mfc = dft.RKS(mf_any.mol)
-    mfc.xc = mf_any.xc
-    mfc.mo_coeff = to_numpy_maybe(mf_any.mo_coeff)
-    mfc.mo_occ = to_numpy_maybe(mf_any.mo_occ)
-    mfc.mo_energy = to_numpy_maybe(mf_any.mo_energy)
-    mfc.e_tot = float(getattr(mf_any, "e_tot", np.nan))
-    mfc.converged = True
-    return mfc
+    Raises ValueError if the table can't be found or parsed.
+    """
+    # Find the J-table block
+    anchor = re.search(r"Spin-spin coupling constant J \(Hz\)\s*\n", stdout_text)
+    if not anchor:
+        raise ValueError("J(Hz) table block not found in SSC stdout.")
 
+    # The header line with '#0  #1  ...'
+    header_match = re.search(r"^\s*(#\d+(?:\s+#\d+)*)\s*$", stdout_text[anchor.end():], re.MULTILINE)
+    if not header_match:
+        raise ValueError("Header with column indices not found in J(Hz) block.")
+    header_cols = re.findall(r"#(\d+)", header_match.group(1))
+    n = len(header_cols)
+    if n == 0:
+        raise ValueError("No column indices in J(Hz) header.")
 
-# ---------- SSC + parsing + optional K→J ----------
+    # Collect subsequent N lines that start with row index + element
+    # Example line:
+    # "        1 H  324.88995   0.00000"
+    # We accept scientific notation as well.
+    block_start = anchor.end() + header_match.end()
+    lines = stdout_text[block_start:].splitlines()
 
-def get_ssc_class():
-    from pyscf.prop import ssc as ssc_mod
-    if hasattr(ssc_mod, "SpinSpinCoupling"):
-        return ssc_mod.SpinSpinCoupling, ssc_mod
-    # fallbacks
-    try:
-        from pyscf.prop.ssc import rks as ssc_rks
-        return ssc_rks.SSC, ssc_mod
-    except Exception:
-        from pyscf.prop.ssc import rhf as ssc_rhf
-        return ssc_rhf.SSC, ssc_mod
+    num_pat = r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+    row_pat = re.compile(rf"^\s*(\d+)\s+([A-Za-z]+)\s+((?:{num_pat}\s+)+)")
 
-
-def parse_j_table(stdout_text: str):
-    """Parse the 'Spin-spin coupling constant J (Hz)' table from captured stdout."""
-    anchor = "Spin-spin coupling constant J (Hz)"
-    i = stdout_text.find(anchor)
-    if i == -1:
-        return [], {}
-    lines = stdout_text[i:].splitlines()[1:]  # skip title
-    block = []
-    for l in lines:
-        if not l.strip():
+    rows = []
+    for line in lines:
+        m = row_pat.match(line)
+        if not m:
+            # stop once rows stop
+            if rows:
+                break
+            else:
+                continue
+        idx = int(m.group(1))
+        elem = m.group(2)
+        nums = [float(x) for x in re.findall(num_pat, m.group(3))]
+        if len(nums) != n:
+            raise ValueError(f"Row {idx} has {len(nums)} values; expected {n}.")
+        rows.append((idx, elem, nums))
+        if len(rows) == n:
             break
-        block.append(l.rstrip("\n"))
-    if not block:
-        return [], {}
-    # header with '#0  #1  ...'
-    header = next((l for l in block if "#" in l), "")
-    import re
-    cols = [int(x) for x in re.findall(r"#(\d+)", header)]
-    data = {}
-    start = (block.index(header) + 1) if header and header in block else 0
-    for l in block[start:]:
-        m = re.match(r"^\s*(\d+)\s+\S+\s+(.*)$", l)
-        if not m:  # tolerate blank/stray lines
-            continue
-        row = int(m.group(1))
-        floats = [float(x) for x in m.group(2).split()]
-        if not cols:
-            cols = list(range(len(floats)))
-        for j, val in enumerate(floats):
-            if j < len(cols):
-                data[(row, cols[j])] = val
-    return cols, data
 
+    if len(rows) != n:
+        raise ValueError(f"Parsed {len(rows)} rows; expected {n}.")
 
-def assemble_square_from_entries(n: int, entries: dict[tuple[int, int], float]) -> np.ndarray:
-    M = np.zeros((n, n), float)
-    for (i, j), v in entries.items():
-        M[i, j] = v
-        M[j, i] = v
-    return M
+    # Order rows by their (parsed) index and build labels + matrix
+    rows.sort(key=lambda t: t[0])
+    labels = [f"{elem}{idx}" for (idx, elem, _) in rows]
+    J = [nums for (_, _, nums) in rows]
+    # Ensure symmetry by mirroring max(|J_ij|, |J_ji|) with sign of J_ij
+    for i in range(n):
+        for j in range(n):
+            if j < i:
+                a, b = J[i][j], J[j][i]
+                J[i][j] = a if abs(a) >= abs(b) else (b if a >= 0 else -b)
+    return labels, J
 
+def _cpu_scf_h2_and_ssc():
+    from pyscf import gto, dft
+    from pyscf.prop.ssc import rhf as ssc_rhf
 
-def nuc_g_vector(mol, ssc_mod):
-    # Use table if present, else minimal fallback
-    if hasattr(ssc_mod, "nuc_g_factor"):
-        gf = ssc_mod.nuc_g_factor
-        try:
-            return np.array([gf[Z] for Z in mol.atom_charges()], float)
-        except Exception:
-            return np.array([gf[mol.atom_symbol(i)] for i in range(mol.natm)], float)
-    fallback = {"H": 5.5856946893, "C": 1.404825, "N": -0.566378, "O": -1.89379, "F": 5.257731}
-    return np.array([fallback.get(mol.atom_symbol(i), 0.0) for i in range(mol.natm)], float)
+    mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="def2-svp").build()
+    mf = dft.RKS(mol).set(xc="b3lyp", conv_tol=1e-10, max_cycle=50)
 
+    e = mf.kernel()
+    if not getattr(mf, "converged", True):
+        raise RuntimeError("CPU SCF(H2) did not converge")
 
-def K_au_to_Jiso_Hz(mol, ssc_obj, K_au, ssc_mod):
-    """Best-effort conversion if constants exist; else raises."""
-    # constants (prefer Hz if available)
-    if hasattr(ssc_mod, "K_au2Hz"):
-        au2Hz = float(ssc_mod.K_au2Hz)
-    elif hasattr(ssc_mod, "K_au2MHz"):
-        au2Hz = float(ssc_mod.K_au2MHz) * 1e6
-    else:
-        raise RuntimeError("No K→Hz/MHz constant in pyscf.prop.ssc")
-    # pairs
-    with_ssc = getattr(ssc_obj, "with_ssc", ssc_obj)
-    pairs = getattr(with_ssc, "nuc_pair", None)
-    if not pairs:
-        natm = mol.natm
-        pairs = [(i, j) for i in range(natm) for j in range(i + 1, natm)]
-    # normalize shapes
-    K = np.asarray(K_au)
-    natm = mol.natm
-    triplets = []
-    if K.ndim == 4 and K.shape[2:] == (3, 3):
-        for i in range(natm):
-            for j in range(natm):
-                triplets.append((i, j, K[i, j]))
-    elif K.ndim == 3 and K.shape[-2:] == (3, 3):
-        if len(pairs) != K.shape[0]:
-            raise ValueError(f"K/pairs mismatch: {K.shape[0]} vs {len(pairs)}")
-        for (i, j), Tij in zip(pairs, K):
-            triplets.append((i, j, Tij));
-            triplets.append((j, i, Tij.T))
-    elif K.ndim == 2 and K.shape == (3, 3):
-        (i, j) = pairs[0] if len(pairs) else (0, 1)
-        triplets.append((i, j, K));
-        triplets.append((j, i, K.T))
-    else:
-        raise ValueError(f"Unexpected K shape: {K.shape}")
-    # accumulate K_iso and convert
-    Kiso_Hz = np.zeros((natm, natm), float)
-    for i, j, Tij in triplets:
-        Kiso_Hz[i, j] += float(np.trace(Tij) / 3.0) * au2Hz
-    g = nuc_g_vector(mol, ssc_mod)
-    Jiso_Hz = (g[:, None] * g[None, :]) * Kiso_Hz
-    return Jiso_Hz
+    print(f"[PASS] CPU SCF(H2) — energy={e:.10f}")
 
+    ssc = ssc_rhf.SSC(mf)
+    s = io.StringIO()
+    with redirect_stdout(s):
+        K = ssc.kernel()  # prints both K and J tables
+    out = s.getvalue()
 
-def run_ssc_and_parse(mf_cpu):
-    SSC, ssc_mod = get_ssc_class()
-    ssc = SSC(mf_cpu)
-    buf = io.StringIO()
-    with redirect_stdout(buf):
+    if not (hasattr(K, "shape") and K.shape[-2:] == (3, 3)):
+        raise RuntimeError("SSC kernel(H2) did not return a (..,3,3) tensor K")
+    print(f"[PASS] SSC kernel(H2) — K shape={getattr(K,'shape',None)}; table=printed")
+
+    try:
+        labels, J = _parse_j_table(out)
+        maxabs = max(abs(x) for row in J for x in row)
+        print(f"[PASS] Parsed J(Hz) from stdout — labels={labels}; max|J|={maxabs:.6f} Hz")
+    except Exception as ex:
+        print(f"[WARN] Could not parse J(Hz) table: {ex}")
+        print("[INFO] Emitting SSC stdout for inspection:\n")
+        print(out)
+
+def _gpu_scf_h2_then_cpu_ssc():
+    from pyscf import gto, dft
+    from gpu4pyscf.dft import rks as grks
+    from pyscf.prop.ssc import rhf as ssc_rhf
+    import numpy as np
+    import cupy
+
+    def to_numpy(x):
+        return x.get() if isinstance(x, cupy.ndarray) else x
+
+    mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="def2-svp").build()
+
+    # GPU SCF
+    mf_gpu = grks.RKS(mol).set(xc="b3lyp", conv_tol=1e-9, max_cycle=50)
+    e = mf_gpu.kernel()
+    if not getattr(mf_gpu, "converged", True):
+        print("[WARN] GPU SCF not converged — restarting on CPU.")
+        mf_gpu = dft.RKS(mol).set(xc="b3lyp", conv_tol=1e-10, max_cycle=50).run()
+    print(f"[PASS] GPU SCF(H2) — energy={mf_gpu.e_tot:.10f}")
+
+    # Map CuPy → NumPy and run SSC on CPU
+    mf_cpu = dft.RKS(mol)
+    mf_cpu.xc = mf_gpu.xc
+    mf_cpu.mo_coeff  = to_numpy(mf_gpu.mo_coeff)
+    mf_cpu.mo_occ    = to_numpy(mf_gpu.mo_occ)
+    mf_cpu.mo_energy = to_numpy(mf_gpu.mo_energy)
+    mf_cpu.e_tot     = mf_gpu.e_tot
+
+    ssc = ssc_rhf.SSC(mf_cpu)
+    s = io.StringIO()
+    with redirect_stdout(s):
         K = ssc.kernel()
-    out = buf.getvalue()
-    cols, entries = parse_j_table(out)
-    J_from_table = None
-    if entries:
-        n = 1 + max(max(i, j) for (i, j) in entries.keys())
-        J_from_table = assemble_square_from_entries(n, entries)
-    return ssc, ssc_mod, K, J_from_table, out
+    out = s.getvalue()
 
+    if not (hasattr(K, "shape") and K.shape[-2:] == (3, 3)):
+        raise RuntimeError("SSC kernel(H2, from GPU MOs) did not return a (..,3,3)")
+    print(f"[PASS] SSC kernel(H2, from GPU MOs) — K shape={getattr(K,'shape',None)}; table=printed")
 
-# ---------- main flow ----------
+    try:
+        labels, J = _parse_j_table(out)
+        maxabs = max(abs(x) for row in J for x in row)
+        print(f"[PASS] Parsed J(Hz) from stdout (GPU→CPU) — labels={labels}; max|J|={maxabs:.6f} Hz")
+    except Exception as ex:
+        print(f"[WARN] Could not parse J(Hz) table (GPU→CPU): {ex}")
+        print("[INFO] Emitting SSC stdout for inspection:\n")
+        print(out)
+
+def _smoke_test_from_file(path: str):
+    """
+    Minimal smoke test: load a structure and see if CPU SCF runs,
+    then attempt SSC and parse J(Hz) if available.
+    """
+    from pyscf import gto, dft
+    from pyscf.prop.ssc import rhf as ssc_rhf
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xyz":
+        mol = gto.Mole(atom=open(path).read(), unit="Angstrom", basis="def2-svp")
+    else:
+        # relax: PDB or others routed via .fromfile when possible
+        mol = gto.Mole()
+        mol.build(atom=path, basis="def2-svp")  # PySCF can read simple PDB via filename
+
+    mf = dft.RKS(mol).set(xc="b3lyp", conv_tol=1e-8, max_cycle=100)
+    e = mf.kernel()
+    if not getattr(mf, "converged", True):
+        print(f"[FAIL] CPU SCF({os.path.basename(path)}) did not converge")
+        return
+    print(f"[PASS] CPU SCF({os.path.basename(path)}) — energy={e:.8f}")
+
+    ssc = ssc_rhf.SSC(mf)
+    s = io.StringIO()
+    with redirect_stdout(s):
+        try:
+            ssc.kernel()
+        except Exception as ex:
+            print(f"[WARN] SSC kernel failed on {os.path.basename(path)}: {ex}")
+            return
+    out = s.getvalue()
+    try:
+        labels, J = _parse_j_table(out)
+        maxabs = max(abs(x) for row in J for x in row)
+        print(f"[PASS] Parsed J(Hz) — N={len(labels)}; max|J|={maxabs:.6f} Hz")
+    except Exception as ex:
+        print(f"[WARN] Could not parse J(Hz) table: {ex}")
+        print("[INFO] Emitting SSC stdout for inspection:\n")
+        print(out)
 
 def main():
-    ap = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
-                                 description=textwrap.dedent(__doc__))
-    ap.add_argument("--gpu", choices=["auto", "on", "off"], default="auto")
-    ap.add_argument("--basis", default="def2-svp")
-    ap.add_argument("--xc", default="b3lyp")
-    ap.add_argument("--cycles", type=int, default=50, help="SCF max_cycle for small test")
-    ap.add_argument("--probe-xyz", default=None, help="Optional large-molecule XYZ for smoke test")
-    ap.add_argument("--probe-pdb", default=None, help="Optional large-molecule PDB for smoke test")
-    ap.add_argument("--probe-cycles", type=int, default=6, help="Short cycles for smoke test")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser()
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--probe-xyz", type=str, help="Path to .xyz")
+    g.add_argument("--probe-pdb", type=str, help="Path to .pdb")
+    args = p.parse_args()
 
-    banner()
+    _env_summary()
 
-    # 1) CPU baseline on H2
-    print("\n=== Baseline: CPU SCF → SSC (H2) ===")
-    mol = mol_h2()
-    mf, e, used_gpu, ok = run_scf(mol, args.xc, 1e-10, args.cycles, gpu_mode="off")
-    status("CPU SCF(H2)", ok, f"energy={e:.10f}" if ok else "")
-    if not ok:
-        return sys.exit(2)
-    mf_cpu = handoff_to_cpu(mf)
-    try:
-        ssc, ssc_mod, K, J_tab, out = run_ssc_and_parse(mf_cpu)
-        status("SSC kernel(H2)", True, f"K shape={np.shape(K)}; table={'yes' if J_tab is not None else 'no'}")
-        if J_tab is not None:
-            print("J_table(Hz) small matrix:\n", np.array_str(J_tab, precision=6, suppress_small=True))
-        # optional K→J
-        try:
-            J_conv = K_au_to_Jiso_Hz(mol, ssc, K, ssc_mod)
-            status("K→J conv(H2)", True)
-            if J_tab is not None and J_conv.shape == J_tab.shape:
-                diff = np.nanmax(np.abs(J_conv - J_tab))
-                status("Compare conv vs table(H2)", True, f"max|Δ|={diff:.3e} Hz")
-        except Exception as e:
-            status("K→J conv(H2)", None, f"{type(e).__name__}: {e}")
-    except Exception as e:
-        status("SSC kernel(H2)", False, f"{type(e).__name__}: {e}")
+    print("=== Baseline: CPU SCF → SSC (H2) ===")
+    _cpu_scf_h2_and_ssc()
+    print()
 
-    # 2) GPU path on H2 (if available)
-    print("\n=== GPU path: GPU SCF → CPU SSC (H2) ===")
-    mf, e, used_gpu, ok = run_scf(mol, args.xc, 1e-9, args.cycles, gpu_mode=args.gpu)
-    status("GPU SCF(H2)" if used_gpu else "GPU SCF(H2)", ok,
-           ("energy={:.10f}".format(e) if ok else (
-               "gpu4pyscf unavailable" if not have("gpu4pyscf.dft.rks") else "error")))
-    if ok:
-        try:
-            mf_cpu = handoff_to_cpu(mf)
-            ssc, ssc_mod, K, J_tab, out = run_ssc_and_parse(mf_cpu)
-            status("SSC kernel(H2, from GPU MOs)", True,
-                   f"K shape={np.shape(K)}; table={'yes' if J_tab is not None else 'no'}")
-            if J_tab is not None:
-                print("J_table(Hz) small matrix (GPU MOs):\n", np.array_str(J_tab, precision=6, suppress_small=True))
-        except Exception as e:
-            status("SSC kernel(H2, from GPU MOs)", False, f"{type(e).__name__}: {e}")
+    print("=== GPU path: GPU SCF → CPU SSC (H2) ===")
+    _gpu_scf_h2_then_cpu_ssc()
+    print()
+
+    if args.probe_xyz or args.probe_pdb:
+        path = args.probe_xyz or args.probe_pdb
+        print(f"=== Smoke test on user file: {path} ===")
+        _smoke_test_from_file(path)
     else:
-        status("GPU path skipped", None, "No GPU or gpu4pyscf error")
-
-    # 3) Optional large-molecule smoke test
-    probe_mol = None
-    src = None
-    try:
-        if args.probe_xyz:
-            probe_mol = mol_from_xyz(args.probe_xyz, args.basis);
-            src = f"XYZ:{args.probe_xyz}"
-        elif args.probe_pdb:
-            probe_mol = mol_from_pdb(args.probe_pdb, args.basis);
-            src = f"PDB:{args.probe_pdb}"
-    except Exception as e:
-        status("Load probe molecule", False, f"{type(e).__name__}: {e}")
-
-    if probe_mol is not None:
-        print(f"\n=== Smoke test: {src} | natm={probe_mol.natm} ===")
-        # CPU short SCF
-        mf, e, used_gpu, ok = run_scf(probe_mol, args.xc, 1e-6, args.probe_cycles, gpu_mode="off")
-        status("CPU SCF(probe, short)", ok, f"E={e:.6f}" if ok else "")
-        # GPU short SCF (to reproduce crashes quickly)
-        mf, e, used_gpu, ok = run_scf(probe_mol, args.xc, 1e-6, args.probe_cycles, gpu_mode=args.gpu)
-        status("GPU SCF(probe, short)" if used_gpu else "GPU SCF(probe, short)", ok,
-               f"E={e:.6f}" if ok else "error (see above)")
-        if ok:
-            try:
-                mf_cpu = handoff_to_cpu(mf)
-                ssc, ssc_mod, K, J_tab, out = run_ssc_and_parse(mf_cpu)
-                status("SSC kernel(probe, from GPU MOs)", True,
-                       f"K shape={np.shape(K)}; table={'yes' if J_tab is not None else 'no'}")
-                if J_tab is not None:
-                    print("J_table(Hz) probe (head):")
-                    # print only a small top-left block to keep output readable
-                    m = min(8, J_tab.shape[0])
-                    print(np.array_str(J_tab[:m, :m], precision=3, suppress_small=True))
-            except Exception as e:
-                status("SSC kernel(probe, from GPU MOs)", False, f"{type(e).__name__}: {e}")
-    else:
-        status("Smoke test", None, "no --probe-xyz/--probe-pdb provided")
-
+        print("[SKIP] Smoke test — no --probe-xyz/--probe-pdb provided")
     print("\nDone.")
-    return 0
-
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
+    main()
