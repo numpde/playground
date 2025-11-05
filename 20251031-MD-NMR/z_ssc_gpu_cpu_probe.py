@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-GPU SCF → CPU SSC probe (PySCF + gpu4pyscf + pyscf-properties)
+GPU SCF → CPU SSC probe (robust shapes)
 
-- SCF: gpu4pyscf.dft.rks (B3LYP/def2-SVP)
-- SSC: pyscf.prop.ssc.* on CPU
-- Converts returned 3x3 reduced-coupling tensor K (a.u.) to scalar J_iso (Hz)
+- SCF (GPU): gpu4pyscf.dft.rks.RKS (B3LYP/def2-SVP)
+- SSC (CPU): pyscf.prop.ssc.* ; converts returned reduced-coupling tensor K (a.u.)
+             to scalar J_iso matrix (Hz), handling (natm,natm,3,3), (npair,3,3), or (3,3).
 
-Expected: prints versions, CUDA accelerators, GPU energy, and a small J matrix in Hz.
-
-Notes:
-- Keep SCF on GPU for speed, but copy MO arrays to CPU before SSC.
-- The numeric J table PySCF prints to stdout should agree with our computed J_iso within ~roundoff.
+Run inside your md-nmr env.
 """
 
 from __future__ import annotations
@@ -22,7 +18,6 @@ import sys
 import numpy as np
 
 
-# --- Versions / accelerators banner -----------------------------------------
 def banner():
     import pyscf
     print(f"PySCF: {pyscf.__version__}")
@@ -44,19 +39,13 @@ def banner():
         print(f"CuPy probe failed: {e}")
 
 
-# --- Build molecule ----------------------------------------------------------
 def build_mol():
-    """Return a simple test molecule. Switch to H2O if you prefer."""
     from pyscf import gto
-    # H2 (helps to see an H–H coupling)
-    geo = "H 0 0 0; H 0 0 0.74"
-    # alt: H2O
-    # geo = "O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587"
+    geo = "H 0 0 0; H 0 0 0.74"  # simple H–H J
     mol = gto.M(atom=geo, basis="def2-svp").build()
     return mol
 
 
-# --- SCF on GPU --------------------------------------------------------------
 def run_gpu_rks(mol, xc="b3lyp", conv_tol=1e-9, max_cycle=50):
     from gpu4pyscf.dft import rks as grks
     mf = grks.RKS(mol).set(xc=xc, conv_tol=conv_tol, max_cycle=max_cycle)
@@ -64,7 +53,6 @@ def run_gpu_rks(mol, xc="b3lyp", conv_tol=1e-9, max_cycle=50):
     return mf, float(e), bool(getattr(mf, "converged", True))
 
 
-# --- Copy CuPy arrays to NumPy & prepare a CPU RKS with those orbitals -------
 def mf_gpu_to_cpu_rks(mf_gpu):
     import cupy as cp
     from pyscf import dft
@@ -78,20 +66,15 @@ def mf_gpu_to_cpu_rks(mf_gpu):
     mf_cpu.mo_occ = to_numpy(mf_gpu.mo_occ)
     mf_cpu.mo_energy = to_numpy(mf_gpu.mo_energy)
     mf_cpu.e_tot = float(getattr(mf_gpu, "e_tot", np.nan))
-    # Mark as "converged" so property routines don't try to re-run SCF
     mf_cpu.converged = True
     return mf_cpu
 
 
-# --- Robust import of SSC class ---------------------------------------------
-def get_ssc_class(mf_cpu):
-    """
-    Prefer the generic SpinSpinCoupling if available; fall back to RKS/RHF-specific class.
-    """
+def get_ssc_class():
+    # Prefer generic; fall back to RKS/RHF
     from pyscf.prop import ssc as ssc_mod
     if hasattr(ssc_mod, "SpinSpinCoupling"):
         return ssc_mod.SpinSpinCoupling, ssc_mod
-    # fallbacks for older layouts
     try:
         from pyscf.prop.ssc import rks as ssc_rks
         return ssc_rks.SSC, ssc_mod
@@ -100,73 +83,105 @@ def get_ssc_class(mf_cpu):
         return ssc_rhf.SSC, ssc_mod
 
 
-# --- Convert 3x3 K tensor (a.u.) → scalar J_iso matrix (Hz) ------------------
-def tensorK_to_Jiso_Hz(mol, K_au, ssc_mod):
-    """
-    K_au: (natm, natm, 3, 3) reduced coupling tensor (atomic units).
-    Returns: J_iso_Hz: (natm, natm) scalar J matrix in Hz.
-    """
-    # 1) Isotropic reduced coupling
-    Kiso_au = np.trace(K_au, axis1=2, axis2=3) / 3.0  # (natm, natm)
-
-    # 2) Nuclear g-factors
-    g = None
+def _nuc_g_vector(mol, ssc_mod):
+    # Try official table; fall back to a small map for common nuclei.
     if hasattr(ssc_mod, "nuc_g_factor"):
         gf = ssc_mod.nuc_g_factor
         try:
-            # index by atomic number if it's an array-like
-            g = np.array([gf[Z] for Z in mol.atom_charges()], float)
+            return np.array([gf[Z] for Z in mol.atom_charges()], float)
         except Exception:
-            # try dict by element symbol
-            g = np.array([gf[mol.atom_symbol(i)] for i in range(mol.natm)], float)
-    if g is None:
-        # minimal fallback (covers typical NMR-active nuclei; extend as needed)
-        fallback = {
-            "H": 5.5856946893, "F": 5.257731, "P": 2.2632, "C": 1.404825, "N": -0.566378,
-            "Si": -1.1106, "O": -1.89379,
-        }
-        g = np.array([fallback[mol.atom_symbol(i)] for i in range(mol.natm)], float)
+            return np.array([gf[mol.atom_symbol(i)] for i in range(mol.natm)], float)
+    fallback = {
+        "H": 5.5856946893, "F": 5.257731, "P": 2.2632, "C": 1.404825, "N": -0.566378,
+        "Si": -1.1106, "O": -1.89379,
+    }
+    return np.array([fallback[mol.atom_symbol(i)] for i in range(mol.natm)], float)
 
-    # 3) a.u. → Hz conversion for reduced coupling K
+
+def _au2Hz_const(ssc_mod):
     if hasattr(ssc_mod, "K_au2Hz"):
-        au2Hz = float(ssc_mod.K_au2Hz)
-    elif hasattr(ssc_mod, "K_au2MHz"):
-        au2Hz = float(ssc_mod.K_au2MHz) * 1e6
-    else:
-        raise RuntimeError("Cannot find K_au→Hz conversion constant in pyscf.prop.ssc")
+        return float(ssc_mod.K_au2Hz)
+    if hasattr(ssc_mod, "K_au2MHz"):
+        return float(ssc_mod.K_au2MHz) * 1e6
+    raise RuntimeError("Cannot find K_au→Hz conversion constant in pyscf.prop.ssc")
 
-    # 4) Scalar J
-    Kiso_Hz = Kiso_au * au2Hz
+
+def assemble_Jiso_from_K(mol, ssc_obj, K_au, ssc_mod):
+    """
+    Handle shapes:
+      (natm,natm,3,3)  – full tensor grid
+      (npair,3,3)      – one tensor per requested pair
+      (3,3)            – single pair tensor
+    """
+    natm = mol.natm
+    g = _nuc_g_vector(mol, ssc_mod)
+    au2Hz = _au2Hz_const(ssc_mod)
+
+    # Make pairs list
+    with_ssc = getattr(ssc_obj, "with_ssc", ssc_obj)
+    pairs = getattr(with_ssc, "nuc_pair", None)
+    if pairs is None or len(pairs) == 0:
+        pairs = [(i, j) for i in range(natm) for j in range(i + 1, natm)]
+
+    # Normalize K shape to a list of (i,j,Kij_3x3)
+    triplets = []
+    K = np.asarray(K_au)
+
+    if K.ndim == 4 and K.shape[2:] == (3, 3):
+        # Full (natm,natm,3,3)
+        for i in range(natm):
+            for j in range(natm):
+                triplets.append((i, j, K[i, j]))
+    elif K.ndim == 3 and K.shape[-2:] == (3, 3):
+        # (npair,3,3): align with pairs order
+        if len(pairs) != K.shape[0]:
+            raise ValueError(f"Shape mismatch: {K.shape[0]} tensors but {len(pairs)} pairs")
+        for (i, j), Tij in zip(pairs, K):
+            triplets.append((i, j, Tij))
+            triplets.append((j, i, Tij.T))  # ensure symmetry
+    elif K.ndim == 2 and K.shape == (3, 3):
+        # Single tensor; require exactly one pair
+        if len(pairs) != 1:
+            # fallback: assume first unique pair
+            i, j = (0, 1) if natm >= 2 else (0, 0)
+        else:
+            (i, j) = pairs[0]
+        triplets.append((i, j, K))
+        triplets.append((j, i, K.T))
+    else:
+        raise ValueError(f"Unexpected K shape: {K.shape}")
+
+    # Accumulate isotropic reduced coupling and convert to J (Hz)
+    Kiso_Hz = np.zeros((natm, natm), float)
+    for i, j, Tij in triplets:
+        Kiso_au = np.trace(Tij) / 3.0
+        Kiso_Hz[i, j] += float(Kiso_au) * au2Hz
+
     Jiso_Hz = (g[:, None] * g[None, :]) * Kiso_Hz
     return Jiso_Hz
 
 
-# --- Main --------------------------------------------------------------------
 def main():
     banner()
     mol = build_mol()
 
-    # GPU SCF
     mf_gpu, e_gpu, conv = run_gpu_rks(mol)
     print(f"\nGPU RKS energy: {e_gpu:.10f}  | converged={conv}")
 
-    # Ensure CPU copy of MOs for properties
     mf_cpu = mf_gpu_to_cpu_rks(mf_gpu)
 
-    # SSC kernel (CPU)
-    SSC, ssc_mod = get_ssc_class(mf_cpu)
+    SSC, ssc_mod = get_ssc_class()
     ssc = SSC(mf_cpu)
-    K_au = ssc.kernel()  # shape: (natm, natm, 3, 3)
 
-    # Convert to scalar J in Hz
-    J_Hz = tensorK_to_Jiso_Hz(mol, np.asarray(K_au), ssc_mod)
+    # Run kernel (will also print PySCF's J/K tables to stdout)
+    K_au = ssc.kernel()
 
-    # Pretty print small J matrix
+    J_Hz = assemble_Jiso_from_K(mol, ssc, K_au, ssc_mod)
+
     with np.printoptions(precision=5, suppress=True):
         print("\nJ_iso (Hz):")
         print(J_Hz)
 
-    # For convenience, list just the H–H entries if present
     idx_H = [i for i in range(mol.natm) if mol.atom_symbol(i) == "H"]
     if len(idx_H) >= 2:
         sub = J_Hz[np.ix_(idx_H, idx_H)]
@@ -179,4 +194,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(130)
-
