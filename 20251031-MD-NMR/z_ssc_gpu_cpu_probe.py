@@ -19,13 +19,28 @@ Usage examples:
 """
 
 from __future__ import annotations
-import argparse, io, os, sys, textwrap
+
+import argparse
 import importlib
 import importlib.util as iu
+import io
+import os
+import sys
+import textwrap
+import warnings
 from contextlib import redirect_stdout
 
 import numpy as np
 from pyscf import gto, dft
+
+# Silence PySCF property-module “under testing / not fully tested” notices
+warnings.filterwarnings(
+    "ignore",
+    message=r"Module .* (is under testing|is not fully tested)",
+    category=UserWarning,
+    module=r"^pyscf\.prop\..*",
+)
+
 
 # ---------- small util ----------
 
@@ -36,6 +51,7 @@ def status(tag: str, ok: bool | None, note: str = ""):
         msg += f" — {note}"
     print(msg)
 
+
 def have(module: str) -> bool:
     try:
         importlib.import_module(module)
@@ -43,9 +59,11 @@ def have(module: str) -> bool:
     except Exception:
         return False
 
+
 def getenv(name: str, default="(unset)"):
     v = os.environ.get(name, default)
     return v if v != "" else "(empty)"
+
 
 # ---------- banner ----------
 
@@ -75,10 +93,12 @@ def banner():
     except Exception as e:
         print(f"gpu4pyscf import: {e}")
 
+
 # ---------- geometry loaders ----------
 
 def mol_h2():
     return gto.M(atom="H 0 0 0; H 0 0 0.74", basis="def2-svp").build()
+
 
 def mol_from_xyz(path: str, basis: str):
     with open(path, "r") as f:
@@ -97,6 +117,7 @@ def mol_from_xyz(path: str, basis: str):
         atom_lines.append(f"{sym} {x} {y} {z}")
     geo = "; ".join(atom_lines)
     return gto.M(atom=geo, basis=basis).build()
+
 
 def mol_from_pdb(path: str, basis: str):
     # Prefer RDKit if present; otherwise try a minimal PDB ATOM parser.
@@ -120,7 +141,9 @@ def mol_from_pdb(path: str, basis: str):
                 continue
             try:
                 sym = (line[76:78].strip() or line[12:16].strip()[0]).strip()
-                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                x = float(line[30:38]);
+                y = float(line[38:46]);
+                z = float(line[46:54])
                 atoms.append(f"{sym} {x:.8f} {y:.8f} {z:.8f}")
             except Exception:
                 continue
@@ -128,6 +151,7 @@ def mol_from_pdb(path: str, basis: str):
         raise ValueError("No atoms parsed from PDB")
     geo = "; ".join(atoms)
     return gto.M(atom=geo, basis=basis).build()
+
 
 # ---------- GPU SCF and CPU hand-off ----------
 
@@ -139,6 +163,7 @@ def to_numpy_maybe(x):
     except Exception:
         pass
     return x
+
 
 def run_scf(mol, xc: str, conv_tol: float, max_cycle: int, gpu_mode: str):
     """gpu_mode: 'on' | 'off' | 'auto'"""
@@ -164,16 +189,18 @@ def run_scf(mol, xc: str, conv_tol: float, max_cycle: int, gpu_mode: str):
     except Exception as e:
         return None, np.nan, False, False
 
+
 def handoff_to_cpu(mf_any):
     """Build a CPU RKS with MO arrays copied (avoid re-running SCF for SSC)."""
     mfc = dft.RKS(mf_any.mol)
     mfc.xc = mf_any.xc
-    mfc.mo_coeff  = to_numpy_maybe(mf_any.mo_coeff)
-    mfc.mo_occ    = to_numpy_maybe(mf_any.mo_occ)
+    mfc.mo_coeff = to_numpy_maybe(mf_any.mo_coeff)
+    mfc.mo_occ = to_numpy_maybe(mf_any.mo_occ)
     mfc.mo_energy = to_numpy_maybe(mf_any.mo_energy)
-    mfc.e_tot     = float(getattr(mf_any, "e_tot", np.nan))
+    mfc.e_tot = float(getattr(mf_any, "e_tot", np.nan))
     mfc.converged = True
     return mfc
+
 
 # ---------- SSC + parsing + optional K→J ----------
 
@@ -188,6 +215,7 @@ def get_ssc_class():
     except Exception:
         from pyscf.prop.ssc import rhf as ssc_rhf
         return ssc_rhf.SSC, ssc_mod
+
 
 def parse_j_table(stdout_text: str):
     """Parse the 'Spin-spin coupling constant J (Hz)' table from captured stdout."""
@@ -222,12 +250,14 @@ def parse_j_table(stdout_text: str):
                 data[(row, cols[j])] = val
     return cols, data
 
-def assemble_square_from_entries(n: int, entries: dict[tuple[int,int], float]) -> np.ndarray:
+
+def assemble_square_from_entries(n: int, entries: dict[tuple[int, int], float]) -> np.ndarray:
     M = np.zeros((n, n), float)
     for (i, j), v in entries.items():
         M[i, j] = v
         M[j, i] = v
     return M
+
 
 def nuc_g_vector(mol, ssc_mod):
     # Use table if present, else minimal fallback
@@ -239,6 +269,7 @@ def nuc_g_vector(mol, ssc_mod):
             return np.array([gf[mol.atom_symbol(i)] for i in range(mol.natm)], float)
     fallback = {"H": 5.5856946893, "C": 1.404825, "N": -0.566378, "O": -1.89379, "F": 5.257731}
     return np.array([fallback.get(mol.atom_symbol(i), 0.0) for i in range(mol.natm)], float)
+
 
 def K_au_to_Jiso_Hz(mol, ssc_obj, K_au, ssc_mod):
     """Best-effort conversion if constants exist; else raises."""
@@ -267,10 +298,12 @@ def K_au_to_Jiso_Hz(mol, ssc_obj, K_au, ssc_mod):
         if len(pairs) != K.shape[0]:
             raise ValueError(f"K/pairs mismatch: {K.shape[0]} vs {len(pairs)}")
         for (i, j), Tij in zip(pairs, K):
-            triplets.append((i, j, Tij)); triplets.append((j, i, Tij.T))
+            triplets.append((i, j, Tij));
+            triplets.append((j, i, Tij.T))
     elif K.ndim == 2 and K.shape == (3, 3):
         (i, j) = pairs[0] if len(pairs) else (0, 1)
-        triplets.append((i, j, K)); triplets.append((j, i, K.T))
+        triplets.append((i, j, K));
+        triplets.append((j, i, K.T))
     else:
         raise ValueError(f"Unexpected K shape: {K.shape}")
     # accumulate K_iso and convert
@@ -280,6 +313,7 @@ def K_au_to_Jiso_Hz(mol, ssc_obj, K_au, ssc_mod):
     g = nuc_g_vector(mol, ssc_mod)
     Jiso_Hz = (g[:, None] * g[None, :]) * Kiso_Hz
     return Jiso_Hz
+
 
 def run_ssc_and_parse(mf_cpu):
     SSC, ssc_mod = get_ssc_class()
@@ -295,11 +329,12 @@ def run_ssc_and_parse(mf_cpu):
         J_from_table = assemble_square_from_entries(n, entries)
     return ssc, ssc_mod, K, J_from_table, out
 
+
 # ---------- main flow ----------
 
 def main():
     ap = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=textwrap.dedent(__doc__))
+                                 description=textwrap.dedent(__doc__))
     ap.add_argument("--gpu", choices=["auto", "on", "off"], default="auto")
     ap.add_argument("--basis", default="def2-svp")
     ap.add_argument("--xc", default="b3lyp")
@@ -340,12 +375,14 @@ def main():
     print("\n=== GPU path: GPU SCF → CPU SSC (H2) ===")
     mf, e, used_gpu, ok = run_scf(mol, args.xc, 1e-9, args.cycles, gpu_mode=args.gpu)
     status("GPU SCF(H2)" if used_gpu else "GPU SCF(H2)", ok,
-           ("energy={:.10f}".format(e) if ok else ("gpu4pyscf unavailable" if not have("gpu4pyscf.dft.rks") else "error")))
+           ("energy={:.10f}".format(e) if ok else (
+               "gpu4pyscf unavailable" if not have("gpu4pyscf.dft.rks") else "error")))
     if ok:
         try:
             mf_cpu = handoff_to_cpu(mf)
             ssc, ssc_mod, K, J_tab, out = run_ssc_and_parse(mf_cpu)
-            status("SSC kernel(H2, from GPU MOs)", True, f"K shape={np.shape(K)}; table={'yes' if J_tab is not None else 'no'}")
+            status("SSC kernel(H2, from GPU MOs)", True,
+                   f"K shape={np.shape(K)}; table={'yes' if J_tab is not None else 'no'}")
             if J_tab is not None:
                 print("J_table(Hz) small matrix (GPU MOs):\n", np.array_str(J_tab, precision=6, suppress_small=True))
         except Exception as e:
@@ -358,9 +395,11 @@ def main():
     src = None
     try:
         if args.probe_xyz:
-            probe_mol = mol_from_xyz(args.probe_xyz, args.basis); src = f"XYZ:{args.probe_xyz}"
+            probe_mol = mol_from_xyz(args.probe_xyz, args.basis);
+            src = f"XYZ:{args.probe_xyz}"
         elif args.probe_pdb:
-            probe_mol = mol_from_pdb(args.probe_pdb, args.basis); src = f"PDB:{args.probe_pdb}"
+            probe_mol = mol_from_pdb(args.probe_pdb, args.basis);
+            src = f"PDB:{args.probe_pdb}"
     except Exception as e:
         status("Load probe molecule", False, f"{type(e).__name__}: {e}")
 
@@ -377,7 +416,8 @@ def main():
             try:
                 mf_cpu = handoff_to_cpu(mf)
                 ssc, ssc_mod, K, J_tab, out = run_ssc_and_parse(mf_cpu)
-                status("SSC kernel(probe, from GPU MOs)", True, f"K shape={np.shape(K)}; table={'yes' if J_tab is not None else 'no'}")
+                status("SSC kernel(probe, from GPU MOs)", True,
+                       f"K shape={np.shape(K)}; table={'yes' if J_tab is not None else 'no'}")
                 if J_tab is not None:
                     print("J_table(Hz) probe (head):")
                     # print only a small top-left block to keep output readable
@@ -390,6 +430,7 @@ def main():
 
     print("\nDone.")
     return 0
+
 
 if __name__ == "__main__":
     try:
