@@ -1,8 +1,11 @@
-xc: b3lyp
-basis: def2-tzvp
+xc: pbe0
+basis: def2-SVP
 charge_spin: (0, 0)
 gpu: True
 pcm_eps: 4.81
 solvent_key: cdcl3
-notes: Per-cluster shieldings (gas-phase), scalar J couplings (Hz) and ddCOSMO single-point energies (Hartree) for Boltzmann weighting.
 keep_isotopes: ['1H']
+ssc_available: 1
+tms_opt: False
+notes: Per-cluster shieldings σ_iso and δ(ppm), scalar J couplings (Hz, if ssc_available=1), and ddCOSMO single-point energies (Hartree) for Boltzmann weighting. All from ONE SCF per cluster. tms_opt=True means Berny optimization was allowed for the TMS reference used for δ(ppm).
+spin_label_order: ['H26', 'H27', 'H28', 'H29', 'H30', 'H31', 'H32', 'H33', 'H34', 'H35', 'H36', 'H37', 'H38', 'H39', 'H40', 'H41', 'H42', 'H43', 'H44', 'H45', 'H46', 'H47']
